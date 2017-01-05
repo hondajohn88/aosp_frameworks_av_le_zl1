@@ -7,7 +7,7 @@ LOCAL_SRC_FILES:= \
 LOCAL_MODULE:= libmedia_helper
 LOCAL_MODULE_TAGS := optional
 
-LOCAL_C_FLAGS += -Werror -Wno-error=deprecated-declarations -Wall
+LOCAL_CFLAGS += -Werror -Wno-error=deprecated-declarations -Wall
 LOCAL_CLANG := true
 
 include $(BUILD_STATIC_LIBRARY)
@@ -30,14 +30,19 @@ LOCAL_SRC_FILES:= \
     AudioSystem.cpp \
     mediaplayer.cpp \
     IMediaCodecList.cpp \
+    IMediaCodecService.cpp \
+    IMediaDrmService.cpp \
     IMediaHTTPConnection.cpp \
     IMediaHTTPService.cpp \
     IMediaLogService.cpp \
+    IMediaExtractor.cpp           \
+    IMediaExtractorService.cpp \
     IMediaPlayerService.cpp \
     IMediaPlayerClient.cpp \
     IMediaRecorderClient.cpp \
     IMediaPlayer.cpp \
     IMediaRecorder.cpp \
+    IMediaSource.cpp \
     IRemoteDisplay.cpp \
     IRemoteDisplayClient.cpp \
     IResourceManagerClient.cpp \
@@ -77,6 +82,9 @@ LOCAL_SHARED_LIBRARIES := \
 
 LOCAL_WHOLE_STATIC_LIBRARIES := libmedia_helper
 
+# for memory heap analysis
+LOCAL_STATIC_LIBRARIES := libc_malloc_debug_backtrace libc_logging
+
 LOCAL_MODULE:= libmedia
 
 LOCAL_ADDITIONAL_DEPENDENCIES := $(LOCAL_PATH)/Android.mk
@@ -90,6 +98,7 @@ LOCAL_C_INCLUDES := \
 
 LOCAL_CFLAGS += -Werror -Wno-error=deprecated-declarations -Wall
 LOCAL_CLANG := true
+LOCAL_SANITIZE := unsigned-integer-overflow signed-integer-overflow
 
 include $(BUILD_SHARED_LIBRARY)
 

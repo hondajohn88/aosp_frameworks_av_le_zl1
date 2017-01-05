@@ -28,6 +28,8 @@
 #include <media/stagefright/MediaErrors.h>
 #include <media/stagefright/MetaData.h>
 #include <media/stagefright/Utils.h>
+#include <OMX_IndexExt.h>
+#include <OMX_VideoExt.h>
 #include <ui/Rect.h>
 
 #include "ih264_typedefs.h"
@@ -157,8 +159,7 @@ SoftAVC::SoftAVC(
             kProfileLevels, NELEM(kProfileLevels),
             176 /* width */, 144 /* height */,
             callbacks, appData, component),
-      mBitrateUpdated(false),
-      mKeyFrameRequested(false),
+      mUpdateFlag(0),
       mIvVideoColorFormat(IV_YUV_420P),
       mAVCEncProfile(IV_PROFILE_BASE),
       mAVCEncLevel(41),
@@ -207,6 +208,7 @@ void  SoftAVC::initEncParams() {
     mEnableAltRef = DEFAULT_ENABLE_ALT_REF;
     mEncSpeed = DEFAULT_ENC_SPEED;
     mIntra4x4 = DEFAULT_INTRA4x4;
+    mConstrainedIntraFlag = DEFAULT_CONSTRAINED_INTRA;
     mAIRMode = DEFAULT_AIR;
     mAIRRefreshPeriod = DEFAULT_AIR_REFRESH_PERIOD;
     mPSNREnable = DEFAULT_PSNR_ENABLE;
@@ -304,6 +306,7 @@ OMX_ERRORTYPE SoftAVC::setIpeParams() {
 
     s_ipe_params_ip.u4_enable_intra_4x4 = mIntra4x4;
     s_ipe_params_ip.u4_enc_speed_preset = mEncSpeed;
+    s_ipe_params_ip.u4_constrained_intra_pred = mConstrainedIntraFlag;
 
     s_ipe_params_ip.u4_timestamp_high = -1;
     s_ipe_params_ip.u4_timestamp_low = -1;
@@ -1013,10 +1016,11 @@ OMX_ERRORTYPE SoftAVC::internalSetParameter(OMX_INDEXTYPE index, const OMX_PTR p
 
             if ((avcType->nAllowedPictureTypes & OMX_VIDEO_PictureTypeB) &&
                     avcType->nPFrames) {
-                mBframes = avcType->nBFrames / avcType->nPFrames;
+                mBframes = avcType->nBFrames;
             }
 
-            mIInterval = avcType->nPFrames + avcType->nBFrames;
+            mIInterval = (avcType->nPFrames + 1) * (avcType->nBFrames + 1);
+            mConstrainedIntraFlag = avcType->bconstIpred;
 
             if (OMX_VIDEO_AVCLoopFilterDisable == avcType->eLoopFilterMode)
                 mDisableDeblkLevel = 4;
@@ -1026,11 +1030,12 @@ OMX_ERRORTYPE SoftAVC::internalSetParameter(OMX_INDEXTYPE index, const OMX_PTR p
                     || avcType->nRefIdx10ActiveMinus1 != 0
                     || avcType->nRefIdx11ActiveMinus1 != 0
                     || avcType->bWeightedPPrediction != OMX_FALSE
-                    || avcType->bconstIpred != OMX_FALSE
                     || avcType->bDirect8x8Inference != OMX_FALSE
                     || avcType->bDirectSpatialTemporal != OMX_FALSE
                     || avcType->nCabacInitIdc != 0) {
-                return OMX_ErrorUndefined;
+                // OMX does not allow a way to signal what values are wrong, so it's
+                // best for components to just do best effort in supporting these values
+                ALOGV("ignoring unsupported settings");
             }
 
             if (OK != ConvertOmxAvcLevelToAvcSpecLevel(avcType->eLevel, &mAVCEncLevel)) {
@@ -1045,9 +1050,35 @@ OMX_ERRORTYPE SoftAVC::internalSetParameter(OMX_INDEXTYPE index, const OMX_PTR p
     }
 }
 
+OMX_ERRORTYPE SoftAVC::getConfig(
+        OMX_INDEXTYPE index, OMX_PTR _params) {
+    switch ((int)index) {
+        case OMX_IndexConfigAndroidIntraRefresh:
+        {
+            OMX_VIDEO_CONFIG_ANDROID_INTRAREFRESHTYPE *intraRefreshParams =
+                (OMX_VIDEO_CONFIG_ANDROID_INTRAREFRESHTYPE *)_params;
+
+            if (!isValidOMXParam(intraRefreshParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (intraRefreshParams->nPortIndex != kOutputPortIndex) {
+                return OMX_ErrorUndefined;
+            }
+
+            intraRefreshParams->nRefreshPeriod =
+                    (mAIRMode == IVE_AIR_MODE_NONE) ? 0 : mAIRRefreshPeriod;
+            return OMX_ErrorNone;
+        }
+
+        default:
+            return SoftVideoEncoderOMXComponent::getConfig(index, _params);
+    }
+}
+
 OMX_ERRORTYPE SoftAVC::setConfig(
         OMX_INDEXTYPE index, const OMX_PTR _params) {
-    switch (index) {
+    switch ((int)index) {
         case OMX_IndexConfigVideoIntraVOPRefresh:
         {
             OMX_CONFIG_INTRAREFRESHVOPTYPE *params =
@@ -1061,7 +1092,9 @@ OMX_ERRORTYPE SoftAVC::setConfig(
                 return OMX_ErrorBadPortIndex;
             }
 
-            mKeyFrameRequested = params->IntraRefreshVOP;
+            if (params->IntraRefreshVOP) {
+                mUpdateFlag |= kRequestKeyFrame;
+            }
             return OMX_ErrorNone;
         }
 
@@ -1080,8 +1113,32 @@ OMX_ERRORTYPE SoftAVC::setConfig(
 
             if (mBitrate != params->nEncodeBitrate) {
                 mBitrate = params->nEncodeBitrate;
-                mBitrateUpdated = true;
+                mUpdateFlag |= kUpdateBitrate;
             }
+            return OMX_ErrorNone;
+        }
+
+        case OMX_IndexConfigAndroidIntraRefresh:
+        {
+            const OMX_VIDEO_CONFIG_ANDROID_INTRAREFRESHTYPE *intraRefreshParams =
+                (const OMX_VIDEO_CONFIG_ANDROID_INTRAREFRESHTYPE *)_params;
+
+            if (!isValidOMXParam(intraRefreshParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (intraRefreshParams->nPortIndex != kOutputPortIndex) {
+                return OMX_ErrorUndefined;
+            }
+
+            if (intraRefreshParams->nRefreshPeriod == 0) {
+                mAIRMode = IVE_AIR_MODE_NONE;
+                mAIRRefreshPeriod = 0;
+            } else if (intraRefreshParams->nRefreshPeriod > 0) {
+                mAIRMode = IVE_AIR_MODE_CYCLIC;
+                mAIRRefreshPeriod = intraRefreshParams->nRefreshPeriod;
+            }
+            mUpdateFlag |= kUpdateAIRMode;
             return OMX_ErrorNone;
         }
 
@@ -1097,7 +1154,7 @@ OMX_ERRORTYPE SoftAVC::internalSetBitrateParams(
     }
 
     mBitrate = bitrate->nTargetBitrate;
-    mBitrateUpdated = true;
+    mUpdateFlag |= kUpdateBitrate;
 
     return OMX_ErrorNone;
 }
@@ -1317,12 +1374,19 @@ void SoftAVC::onQueueFilled(OMX_U32 portIndex) {
             return;
         }
 
-        if (mBitrateUpdated) {
-            setBitRate();
-        }
-
-        if (mKeyFrameRequested) {
-            setFrameType(IV_IDR_FRAME);
+        if (mUpdateFlag) {
+            if (mUpdateFlag & kUpdateBitrate) {
+                setBitRate();
+            }
+            if (mUpdateFlag & kRequestKeyFrame) {
+                setFrameType(IV_IDR_FRAME);
+            }
+            if (mUpdateFlag & kUpdateAIRMode) {
+                setAirParams();
+                notify(OMX_EventPortSettingsChanged, kOutputPortIndex,
+                        OMX_IndexConfigAndroidIntraRefresh, NULL);
+            }
+            mUpdateFlag = 0;
         }
 
         if ((inputBufferHeader != NULL)

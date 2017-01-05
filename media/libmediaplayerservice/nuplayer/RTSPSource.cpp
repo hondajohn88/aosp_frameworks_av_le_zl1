@@ -32,6 +32,12 @@ namespace android {
 
 const int64_t kNearEOSTimeoutUs = 2000000ll; // 2 secs
 
+// Buffer Underflow/Prepare/StartServer/Overflow Marks
+const int64_t NuPlayer::RTSPSource::kUnderflowMarkUs   =  1000000ll;
+const int64_t NuPlayer::RTSPSource::kPrepareMarkUs     =  3000000ll;
+const int64_t NuPlayer::RTSPSource::kStartServerMarkUs =  5000000ll;
+const int64_t NuPlayer::RTSPSource::kOverflowMarkUs    = 10000000ll;
+
 NuPlayer::RTSPSource::RTSPSource(
         const sp<AMessage> &notify,
         const sp<IMediaHTTPService> &httpService,
@@ -51,6 +57,8 @@ NuPlayer::RTSPSource::RTSPSource(
       mFinalResult(OK),
       mDisconnectReplyID(0),
       mBuffering(false),
+      mInPreparationPhase(true),
+      mEOSPending(false),
       mSeekGeneration(0),
       mEOSTimeoutAudio(0),
       mEOSTimeoutVideo(0) {
@@ -76,6 +84,11 @@ NuPlayer::RTSPSource::~RTSPSource() {
 }
 
 void NuPlayer::RTSPSource::prepareAsync() {
+    if (mIsSDP && mHTTPService == NULL) {
+        notifyPrepared(BAD_VALUE);
+        return;
+    }
+
     if (mLooper == NULL) {
         mLooper = new ALooper;
         mLooper->setName("rtsp");
@@ -120,29 +133,6 @@ void NuPlayer::RTSPSource::stop() {
 
     sp<AMessage> dummy;
     msg->postAndAwaitResponse(&dummy);
-}
-
-void NuPlayer::RTSPSource::pause() {
-    int64_t mediaDurationUs = 0;
-    getDuration(&mediaDurationUs);
-    for (size_t index = 0; index < mTracks.size(); index++) {
-        TrackInfo *info = &mTracks.editItemAt(index);
-        sp<AnotherPacketSource> source = info->mSource;
-
-        // Check if EOS or ERROR is received
-        if (source != NULL && source->isFinished(mediaDurationUs)) {
-            return;
-        }
-    }
-    if (mHandler != NULL) {
-        mHandler->pause();
-    }
-}
-
-void NuPlayer::RTSPSource::resume() {
-    if (mHandler != NULL) {
-        mHandler->resume();
-    }
 }
 
 status_t NuPlayer::RTSPSource::feedMoreTSData() {
@@ -211,34 +201,28 @@ status_t NuPlayer::RTSPSource::dequeueAccessUnit(
     status_t finalResult;
     if (!source->hasBufferAvailable(&finalResult)) {
         if (finalResult == OK) {
-            int64_t mediaDurationUs = 0;
-            getDuration(&mediaDurationUs);
-            sp<AnotherPacketSource> otherSource = getSource(!audio);
-            status_t otherFinalResult;
 
-            // If other source already signaled EOS, this source should also signal EOS
-            if (otherSource != NULL &&
-                    !otherSource->hasBufferAvailable(&otherFinalResult) &&
-                    otherFinalResult == ERROR_END_OF_STREAM) {
-                source->signalEOS(ERROR_END_OF_STREAM);
+            // If other source already signaled EOS, this source should also return EOS
+            if (sourceReachedEOS(!audio)) {
                 return ERROR_END_OF_STREAM;
             }
 
             // If this source has detected near end, give it some time to retrieve more
-            // data before signaling EOS
+            // data before returning EOS
+            int64_t mediaDurationUs = 0;
+            getDuration(&mediaDurationUs);
             if (source->isFinished(mediaDurationUs)) {
                 int64_t eosTimeout = audio ? mEOSTimeoutAudio : mEOSTimeoutVideo;
                 if (eosTimeout == 0) {
                     setEOSTimeout(audio, ALooper::GetNowUs());
                 } else if ((ALooper::GetNowUs() - eosTimeout) > kNearEOSTimeoutUs) {
                     setEOSTimeout(audio, 0);
-                    source->signalEOS(ERROR_END_OF_STREAM);
                     return ERROR_END_OF_STREAM;
                 }
                 return -EWOULDBLOCK;
             }
 
-            if (!(otherSource != NULL && otherSource->isFinished(mediaDurationUs))) {
+            if (!sourceNearEOS(!audio)) {
                 // We should not enter buffering mode
                 // if any of the sources already have detected EOS.
                 startBufferingIfNecessary();
@@ -317,6 +301,148 @@ void NuPlayer::RTSPSource::performSeek(int64_t seekTimeUs) {
 
     mState = SEEKING;
     mHandler->seek(seekTimeUs);
+    mEOSPending = false;
+}
+
+void NuPlayer::RTSPSource::schedulePollBuffering() {
+    sp<AMessage> msg = new AMessage(kWhatPollBuffering, this);
+    msg->post(1000000ll); // 1 second intervals
+}
+
+void NuPlayer::RTSPSource::checkBuffering(
+        bool *prepared, bool *underflow, bool *overflow, bool *startServer, bool *finished) {
+    size_t numTracks = mTracks.size();
+    size_t preparedCount, underflowCount, overflowCount, startCount, finishedCount;
+    preparedCount = underflowCount = overflowCount = startCount = finishedCount = 0;
+
+    size_t count = numTracks;
+    for (size_t i = 0; i < count; ++i) {
+        status_t finalResult;
+        TrackInfo *info = &mTracks.editItemAt(i);
+        sp<AnotherPacketSource> src = info->mSource;
+        if (src == NULL) {
+            --numTracks;
+            continue;
+        }
+        int64_t bufferedDurationUs = src->getBufferedDurationUs(&finalResult);
+
+        // isFinished when duration is 0 checks for EOS result only
+        if (bufferedDurationUs > kPrepareMarkUs || src->isFinished(/* duration */ 0)) {
+            ++preparedCount;
+        }
+
+        if (src->isFinished(/* duration */ 0)) {
+            ++overflowCount;
+            ++finishedCount;
+        } else {
+            if (bufferedDurationUs < kUnderflowMarkUs) {
+                ++underflowCount;
+            }
+            if (bufferedDurationUs > kOverflowMarkUs) {
+                ++overflowCount;
+            }
+            if (bufferedDurationUs < kStartServerMarkUs) {
+                ++startCount;
+            }
+        }
+    }
+
+    *prepared    = (preparedCount == numTracks);
+    *underflow   = (underflowCount > 0);
+    *overflow    = (overflowCount == numTracks);
+    *startServer = (startCount > 0);
+    *finished    = (finishedCount > 0);
+}
+
+void NuPlayer::RTSPSource::onPollBuffering() {
+    bool prepared, underflow, overflow, startServer, finished;
+    checkBuffering(&prepared, &underflow, &overflow, &startServer, &finished);
+
+    if (prepared && mInPreparationPhase) {
+        mInPreparationPhase = false;
+        notifyPrepared();
+    }
+
+    if (!mInPreparationPhase && underflow) {
+        startBufferingIfNecessary();
+    }
+
+    if (haveSufficientDataOnAllTracks()) {
+        stopBufferingIfNecessary();
+    }
+
+    if (overflow && mHandler != NULL) {
+        mHandler->pause();
+    }
+
+    if (startServer && mHandler != NULL) {
+        mHandler->resume();
+    }
+
+    if (finished && mHandler != NULL) {
+        mHandler->cancelAccessUnitTimeoutCheck();
+    }
+
+    schedulePollBuffering();
+}
+
+void NuPlayer::RTSPSource::signalSourceEOS(status_t result) {
+    const bool audio = true;
+    const bool video = false;
+
+    sp<AnotherPacketSource> source = getSource(audio);
+    if (source != NULL) {
+        source->signalEOS(result);
+    }
+
+    source = getSource(video);
+    if (source != NULL) {
+        source->signalEOS(result);
+    }
+}
+
+bool NuPlayer::RTSPSource::sourceReachedEOS(bool audio) {
+    sp<AnotherPacketSource> source = getSource(audio);
+    status_t finalResult;
+    return (source != NULL &&
+            !source->hasBufferAvailable(&finalResult) &&
+            finalResult == ERROR_END_OF_STREAM);
+}
+
+bool NuPlayer::RTSPSource::sourceNearEOS(bool audio) {
+    sp<AnotherPacketSource> source = getSource(audio);
+    int64_t mediaDurationUs = 0;
+    getDuration(&mediaDurationUs);
+    return (source != NULL && source->isFinished(mediaDurationUs));
+}
+
+void NuPlayer::RTSPSource::onSignalEOS(const sp<AMessage> &msg) {
+    int32_t generation;
+    CHECK(msg->findInt32("generation", &generation));
+
+    if (generation != mSeekGeneration) {
+        return;
+    }
+
+    if (mEOSPending) {
+        signalSourceEOS(ERROR_END_OF_STREAM);
+        mEOSPending = false;
+    }
+}
+
+void NuPlayer::RTSPSource::postSourceEOSIfNecessary() {
+    const bool audio = true;
+    const bool video = false;
+    // If a source has detected near end, give it some time to retrieve more
+    // data before signaling EOS
+    if (sourceNearEOS(audio) || sourceNearEOS(video)) {
+        if (!mEOSPending) {
+            sp<AMessage> msg = new AMessage(kWhatSignalEOS, this);
+            msg->setInt32("generation", mSeekGeneration);
+            msg->post(kNearEOSTimeoutUs);
+            mEOSPending = true;
+        }
+    }
 }
 
 void NuPlayer::RTSPSource::onMessageReceived(const sp<AMessage> &msg) {
@@ -343,6 +469,12 @@ void NuPlayer::RTSPSource::onMessageReceived(const sp<AMessage> &msg) {
 
         performSeek(seekTimeUs);
         return;
+    } else if (msg->what() == kWhatPollBuffering) {
+        onPollBuffering();
+        return;
+    } else if (msg->what() == kWhatSignalEOS) {
+        onSignalEOS(msg);
+        return;
     }
 
     CHECK_EQ(msg->what(), (int)kWhatNotify);
@@ -367,7 +499,7 @@ void NuPlayer::RTSPSource::onMessageReceived(const sp<AMessage> &msg) {
             }
 
             notifyFlagsChanged(flags);
-            notifyPrepared();
+            schedulePollBuffering();
             break;
         }
 
@@ -380,10 +512,8 @@ void NuPlayer::RTSPSource::onMessageReceived(const sp<AMessage> &msg) {
         case MyHandler::kWhatSeekDone:
         {
             mState = CONNECTED;
-            if (mSeekReplyID != NULL) {
-                // Unblock seekTo here in case we attempted to seek in a live stream
-                finishSeek(OK);
-            }
+            // Unblock seekTo here in case we attempted to seek in a live stream
+            finishSeek(OK);
             break;
         }
 
@@ -404,12 +534,13 @@ void NuPlayer::RTSPSource::onMessageReceived(const sp<AMessage> &msg) {
 
             status_t err = OK;
             msg->findInt32("err", &err);
-            finishSeek(err);
 
             if (err == OK) {
                 int64_t timeUs;
                 CHECK(msg->findInt64("time", &timeUs));
                 mHandler->continueSeekAfterPause(timeUs);
+            } else {
+                finishSeek(err);
             }
             break;
         }
@@ -453,16 +584,10 @@ void NuPlayer::RTSPSource::onMessageReceived(const sp<AMessage> &msg) {
                 }
 
                 if (err != OK) {
-                    sp<AnotherPacketSource> source = getSource(false /* audio */);
-                    if (source != NULL) {
-                        source->signalEOS(err);
-                    }
-
-                    source = getSource(true /* audio */);
-                    if (source != NULL) {
-                        source->signalEOS(err);
-                    }
+                    signalSourceEOS(err);
                 }
+
+                postSourceEOSIfNecessary();
                 break;
             }
 
@@ -490,6 +615,7 @@ void NuPlayer::RTSPSource::onMessageReceived(const sp<AMessage> &msg) {
 
                 source->queueAccessUnit(accessUnit);
             }
+            postSourceEOSIfNecessary();
             break;
         }
 
@@ -500,17 +626,7 @@ void NuPlayer::RTSPSource::onMessageReceived(const sp<AMessage> &msg) {
             CHECK_NE(finalResult, (status_t)OK);
 
             if (mTSParser != NULL) {
-                sp<AnotherPacketSource> source = getSource(false /* audio */);
-                if (source != NULL) {
-                    source->signalEOS(finalResult);
-                }
-
-                source = getSource(true /* audio */);
-                if (source != NULL) {
-                    source->signalEOS(finalResult);
-                }
-
-                return;
+                signalSourceEOS(finalResult);
             }
 
             size_t trackIndex;
@@ -720,7 +836,7 @@ void NuPlayer::RTSPSource::startBufferingIfNecessary() {
         mBuffering = true;
 
         sp<AMessage> notify = dupNotify();
-        notify->setInt32("what", kWhatBufferingStart);
+        notify->setInt32("what", kWhatPauseOnBufferingStart);
         notify->post();
     }
 }
@@ -736,7 +852,7 @@ bool NuPlayer::RTSPSource::stopBufferingIfNecessary() {
         mBuffering = false;
 
         sp<AMessage> notify = dupNotify();
-        notify->setInt32("what", kWhatBufferingEnd);
+        notify->setInt32("what", kWhatResumeOnBufferingEnd);
         notify->post();
     }
 
@@ -744,7 +860,9 @@ bool NuPlayer::RTSPSource::stopBufferingIfNecessary() {
 }
 
 void NuPlayer::RTSPSource::finishSeek(status_t err) {
-    CHECK(mSeekReplyID != NULL);
+    if (mSeekReplyID == NULL) {
+        return;
+    }
     sp<AMessage> seekReply = new AMessage;
     seekReply->setInt32("err", err);
     seekReply->postReply(mSeekReplyID);

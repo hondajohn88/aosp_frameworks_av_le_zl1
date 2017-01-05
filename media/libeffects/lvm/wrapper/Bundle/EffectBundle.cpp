@@ -722,17 +722,20 @@ int LvmBundle_process(LVM_INT16        *pIn,
 
     if (pContext->config.outputCfg.accessMode == EFFECT_BUFFER_ACCESS_WRITE){
         pOutTmp = pOut;
-    }else if (pContext->config.outputCfg.accessMode == EFFECT_BUFFER_ACCESS_ACCUMULATE){
+    } else if (pContext->config.outputCfg.accessMode == EFFECT_BUFFER_ACCESS_ACCUMULATE){
         if (pContext->pBundledContext->frameCount != frameCount) {
             if (pContext->pBundledContext->workBuffer != NULL) {
                 free(pContext->pBundledContext->workBuffer);
             }
             pContext->pBundledContext->workBuffer =
-                    (LVM_INT16 *)malloc(frameCount * sizeof(LVM_INT16) * 2);
+                    (LVM_INT16 *)calloc(frameCount, sizeof(LVM_INT16) * 2);
+            if (pContext->pBundledContext->workBuffer == NULL) {
+                return -ENOMEM;
+            }
             pContext->pBundledContext->frameCount = frameCount;
         }
         pOutTmp = pContext->pBundledContext->workBuffer;
-    }else{
+    } else {
         ALOGV("LVM_ERROR : LvmBundle_process invalid access mode");
         return -EINVAL;
     }
@@ -2354,8 +2357,12 @@ int Equalizer_getParameter(EffectContext     *pContext,
 
     case EQ_PARAM_BAND_LEVEL:
         param2 = *pParamTemp;
-        if (param2 >= FIVEBAND_NUMBANDS) {
+        if (param2 < 0 || param2 >= FIVEBAND_NUMBANDS) {
             status = -EINVAL;
+            if (param2 < 0) {
+                android_errorWriteLog(0x534e4554, "32438598");
+                ALOGW("\tERROR Equalizer_getParameter() EQ_PARAM_BAND_LEVEL band %d", param2);
+            }
             break;
         }
         *(int16_t *)pValue = (int16_t)EqualizerGetBandLevel(pContext, param2);
@@ -2365,8 +2372,12 @@ int Equalizer_getParameter(EffectContext     *pContext,
 
     case EQ_PARAM_CENTER_FREQ:
         param2 = *pParamTemp;
-        if (param2 >= FIVEBAND_NUMBANDS) {
+        if (param2 < 0 || param2 >= FIVEBAND_NUMBANDS) {
             status = -EINVAL;
+            if (param2 < 0) {
+                android_errorWriteLog(0x534e4554, "32436341");
+                ALOGW("\tERROR Equalizer_getParameter() EQ_PARAM_CENTER_FREQ band %d", param2);
+            }
             break;
         }
         *(int32_t *)pValue = EqualizerGetCentreFrequency(pContext, param2);
@@ -2376,8 +2387,12 @@ int Equalizer_getParameter(EffectContext     *pContext,
 
     case EQ_PARAM_BAND_FREQ_RANGE:
         param2 = *pParamTemp;
-        if (param2 >= FIVEBAND_NUMBANDS) {
+        if (param2 < 0 || param2 >= FIVEBAND_NUMBANDS) {
             status = -EINVAL;
+            if (param2 < 0) {
+                android_errorWriteLog(0x534e4554, "32247948");
+                ALOGW("\tERROR Equalizer_getParameter() EQ_PARAM_BAND_FREQ_RANGE band %d", param2);
+            }
             break;
         }
         EqualizerGetBandFreqRange(pContext, param2, (uint32_t *)pValue, ((uint32_t *)pValue + 1));
@@ -2404,9 +2419,13 @@ int Equalizer_getParameter(EffectContext     *pContext,
 
     case EQ_PARAM_GET_PRESET_NAME:
         param2 = *pParamTemp;
-        if (param2 >= EqualizerGetNumPresets()) {
-        //if (param2 >= 20) {     // AGO FIX
+        if ((param2 < 0 && param2 != PRESET_CUSTOM) ||  param2 >= EqualizerGetNumPresets()) {
             status = -EINVAL;
+            if (param2 < 0) {
+                android_errorWriteLog(0x534e4554, "32448258");
+                ALOGE("\tERROR Equalizer_getParameter() EQ_PARAM_GET_PRESET_NAME preset %d",
+                        param2);
+            }
             break;
         }
         name = (char *)pValue;
@@ -2476,8 +2495,12 @@ int Equalizer_setParameter (EffectContext *pContext, void *pParam, void *pValue)
         band =  *pParamTemp;
         level = (int32_t)(*(int16_t *)pValue);
         //ALOGV("\tEqualizer_setParameter() EQ_PARAM_BAND_LEVEL band %d, level %d", band, level);
-        if (band >= FIVEBAND_NUMBANDS) {
+        if (band < 0 || band >= FIVEBAND_NUMBANDS) {
             status = -EINVAL;
+            if (band < 0) {
+                android_errorWriteLog(0x534e4554, "32095626");
+                ALOGE("\tERROR Equalizer_setParameter() EQ_PARAM_BAND_LEVEL band %d", band);
+            }
             break;
         }
         EqualizerSetBandLevel(pContext, band, level);
@@ -2872,7 +2895,7 @@ int Effect_process(effect_handle_t     self,
     EffectContext * pContext = (EffectContext *) self;
     LVM_ReturnStatus_en     LvmStatus = LVM_SUCCESS;                /* Function call status */
     int    status = 0;
-    int    lvmStatus = 0;
+    int    processStatus = 0;
     LVM_INT16   *in  = (LVM_INT16 *)inBuffer->raw;
     LVM_INT16   *out = (LVM_INT16 *)outBuffer->raw;
 
@@ -2960,19 +2983,22 @@ int Effect_process(effect_handle_t     self,
         //pContext->pBundledContext->NumberEffectsEnabled,
         //pContext->pBundledContext->NumberEffectsCalled, pContext->EffectType);
 
-        if(status == -ENODATA){
+        if (status == -ENODATA){
             ALOGV("\tEffect_process() processing last frame");
         }
         pContext->pBundledContext->NumberEffectsCalled = 0;
         /* Process all the available frames, block processing is
            handled internalLY by the LVM bundle */
-        lvmStatus = android::LvmBundle_process(    (LVM_INT16 *)inBuffer->raw,
+        processStatus = android::LvmBundle_process(    (LVM_INT16 *)inBuffer->raw,
                                                 (LVM_INT16 *)outBuffer->raw,
                                                 outBuffer->frameCount,
                                                 pContext);
-        if(lvmStatus != LVM_SUCCESS){
-            ALOGV("\tLVM_ERROR : LvmBundle_process returned error %d", lvmStatus);
-            return lvmStatus;
+        if (processStatus != 0){
+            ALOGV("\tLVM_ERROR : LvmBundle_process returned error %d", processStatus);
+            if (status == 0) {
+                status = processStatus;
+            }
+            return status;
         }
     } else {
         //ALOGV("\tEffect_process Not Calling process with %d effects enabled, %d called: Effect %d",

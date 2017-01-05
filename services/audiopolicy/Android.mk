@@ -24,6 +24,7 @@ LOCAL_C_INCLUDES := \
     $(call include-path-for, audio-utils) \
     $(TOPDIR)frameworks/av/services/audiopolicy/common/include \
     $(TOPDIR)frameworks/av/services/audiopolicy/engine/interface \
+    $(TOPDIR)frameworks/av/services/audiopolicy/utilities
 
 LOCAL_SHARED_LIBRARIES := \
     libcutils \
@@ -35,28 +36,24 @@ LOCAL_SHARED_LIBRARIES := \
     libhardware_legacy \
     libserviceutility
 
-ifneq ($(USE_LEGACY_AUDIO_POLICY), 1)
-LOCAL_SHARED_LIBRARIES += \
-    libaudiopolicymanager
-endif
-
 LOCAL_STATIC_LIBRARIES := \
     libmedia_helper \
     libaudiopolicycomponents
 
+LOCAL_MULTILIB := $(AUDIOSERVER_MULTILIB)
+
 LOCAL_MODULE:= libaudiopolicyservice
 
 LOCAL_CFLAGS += -fvisibility=hidden
+LOCAL_CFLAGS += -Wall -Werror
 
 include $(BUILD_SHARED_LIBRARY)
-
 
 ifneq ($(USE_LEGACY_AUDIO_POLICY), 1)
 
 include $(CLEAR_VARS)
 
-LOCAL_SRC_FILES:= \
-    managerdefault/AudioPolicyManager.cpp \
+LOCAL_SRC_FILES:= managerdefault/AudioPolicyManager.cpp
 
 LOCAL_SHARED_LIBRARIES := \
     libcutils \
@@ -66,12 +63,15 @@ LOCAL_SHARED_LIBRARIES := \
 
 ifeq ($(USE_CONFIGURABLE_AUDIO_POLICY), 1)
 
+ifneq ($(USE_XML_AUDIO_POLICY_CONF), 1)
+$(error Configurable policy does not support legacy conf file)
+endif #ifneq ($(USE_XML_AUDIO_POLICY_CONF), 1)
+
 LOCAL_REQUIRED_MODULES := \
     parameter-framework.policy \
     audio_policy_criteria.conf \
 
-LOCAL_C_INCLUDES += \
-    $(TOPDIR)frameworks/av/services/audiopolicy/engineconfigurable/include \
+LOCAL_C_INCLUDES += $(TOPDIR)frameworks/av/services/audiopolicy/engineconfigurable/include
 
 LOCAL_SHARED_LIBRARIES += libaudiopolicyengineconfigurable
 
@@ -79,17 +79,30 @@ else
 
 LOCAL_SHARED_LIBRARIES += libaudiopolicyenginedefault
 
-endif
+endif # ifeq ($(USE_CONFIGURABLE_AUDIO_POLICY), 1)
 
 LOCAL_C_INCLUDES += \
     $(TOPDIR)frameworks/av/services/audiopolicy/common/include \
     $(TOPDIR)frameworks/av/services/audiopolicy/engine/interface \
+    $(TOPDIR)frameworks/av/services/audiopolicy/utilities
 
 LOCAL_STATIC_LIBRARIES := \
     libmedia_helper \
     libaudiopolicycomponents
 
-LOCAL_MODULE:= libaudiopolicymanager
+ifeq ($(USE_XML_AUDIO_POLICY_CONF), 1)
+LOCAL_STATIC_LIBRARIES += libxml2
+
+LOCAL_SHARED_LIBRARIES += libicuuc
+
+LOCAL_CFLAGS += -DUSE_XML_AUDIO_POLICY_CONF
+endif #ifeq ($(USE_XML_AUDIO_POLICY_CONF), 1)
+
+LOCAL_CFLAGS += -Wall -Werror
+
+LOCAL_MULTILIB := $(AUDIOSERVER_MULTILIB)
+
+LOCAL_MODULE:= libaudiopolicymanagerdefault
 
 include $(BUILD_SHARED_LIBRARY)
 
@@ -108,7 +121,11 @@ LOCAL_STATIC_LIBRARIES := \
 
 LOCAL_C_INCLUDES += \
     $(TOPDIR)frameworks/av/services/audiopolicy/common/include \
-    $(TOPDIR)frameworks/av/services/audiopolicy/engine/interface \
+    $(TOPDIR)frameworks/av/services/audiopolicy/engine/interface
+
+LOCAL_CFLAGS := -Wall -Werror
+
+LOCAL_MULTILIB := $(AUDIOSERVER_MULTILIB)
 
 LOCAL_MODULE:= libaudiopolicymanager
 

@@ -41,10 +41,37 @@ unsigned parseUE(ABitReader *br) {
     return x + (1u << numZeroes) - 1;
 }
 
+unsigned parseUEWithFallback(ABitReader *br, unsigned fallback) {
+    unsigned numZeroes = 0;
+    while (br->getBitsWithFallback(1, 1) == 0) {
+        ++numZeroes;
+    }
+    uint32_t x;
+    if (numZeroes < 32) {
+        if (br->getBitsGraceful(numZeroes, &x)) {
+            return x + (1u << numZeroes) - 1;
+        } else {
+            return fallback;
+        }
+    } else {
+        br->skipBits(numZeroes);
+        return fallback;
+    }
+}
+
 signed parseSE(ABitReader *br) {
     unsigned codeNum = parseUE(br);
 
-    return (codeNum & 1) ? (codeNum + 1) / 2 : -(codeNum / 2);
+    return (codeNum & 1) ? (codeNum + 1) / 2 : -signed(codeNum / 2);
+}
+
+signed parseSEWithFallback(ABitReader *br, signed fallback) {
+    // NOTE: parseUE cannot normally return ~0 as the max supported value is 0xFFFE
+    unsigned codeNum = parseUEWithFallback(br, ~0U);
+    if (codeNum == ~0U) {
+        return fallback;
+    }
+    return (codeNum & 1) ? (codeNum + 1) / 2 : -signed(codeNum / 2);
 }
 
 static void skipScalingList(ABitReader *br, size_t sizeOfScalingList) {
@@ -462,6 +489,28 @@ bool IsAVCReferenceFrame(const sp<ABuffer> &accessUnit) {
     }
 
     return true;
+}
+
+uint32_t FindAVCLayerId(const uint8_t *data, size_t size) {
+    CHECK(data != NULL);
+
+    const unsigned kSvcNalType = 0xE;
+    const unsigned kSvcNalSearchRange = 32;
+    // SVC NAL
+    // |---0 1110|1--- ----|---- ----|iii- ---|
+    //       ^                        ^
+    //   NAL-type = 0xE               layer-Id
+    //
+    // layer_id 0 is for base layer, while 1, 2, ... are enhancement layers.
+    // Layer n uses reference frames from layer 0, 1, ..., n-1.
+
+    uint32_t layerId = 0;
+    sp<ABuffer> svcNAL = FindNAL(
+            data, size > kSvcNalSearchRange ? kSvcNalSearchRange : size, kSvcNalType);
+    if (svcNAL != NULL && svcNAL->size() >= 4) {
+        layerId = (*(svcNAL->data() + 3) >> 5) & 0x7;
+    }
+    return layerId;
 }
 
 sp<MetaData> MakeAACCodecSpecificData(

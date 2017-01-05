@@ -36,7 +36,9 @@ public:
     virtual status_t listNodes(List<ComponentInfo> *list);
 
     virtual status_t allocateNode(
-            const char *name, const sp<IOMXObserver> &observer, node_id *node);
+            const char *name, const sp<IOMXObserver> &observer,
+            sp<IBinder> *nodeBinder,
+            node_id *node);
 
     virtual status_t freeNode(node_id node);
 
@@ -62,8 +64,8 @@ public:
     virtual status_t getState(
             node_id node, OMX_STATETYPE* state);
 
-    virtual status_t enableGraphicBuffers(
-            node_id node, OMX_U32 port_index, OMX_BOOL enable);
+    virtual status_t enableNativeBuffers(
+            node_id node, OMX_U32 port_index, OMX_BOOL graphic, OMX_BOOL enable);
 
     virtual status_t getGraphicBufferUsage(
             node_id node, OMX_U32 port_index, OMX_U32* usage);
@@ -81,7 +83,7 @@ public:
 
     virtual status_t useBuffer(
             node_id node, OMX_U32 port_index, const sp<IMemory> &params,
-            buffer_id *buffer, OMX_U32 allottedSize, OMX_BOOL crossProcess);
+            buffer_id *buffer, OMX_U32 allottedSize);
 
     virtual status_t useGraphicBuffer(
             node_id node, OMX_U32 port_index,
@@ -91,8 +93,12 @@ public:
             node_id node, OMX_U32 port_index,
             const sp<GraphicBuffer> &graphicBuffer, buffer_id buffer);
 
-    virtual status_t createInputSurface(
+    virtual status_t updateNativeHandleInMeta(
             node_id node, OMX_U32 port_index,
+            const sp<NativeHandle> &nativeHandle, buffer_id buffer);
+
+    virtual status_t createInputSurface(
+            node_id node, OMX_U32 port_index, android_dataspace dataSpace,
             sp<IGraphicBufferProducer> *bufferProducer,
             MetadataBufferType *type);
 
@@ -107,13 +113,13 @@ public:
 
     virtual status_t signalEndOfInputStream(node_id node);
 
-    virtual status_t allocateBuffer(
+    virtual status_t allocateSecureBuffer(
             node_id node, OMX_U32 port_index, size_t size,
-            buffer_id *buffer, void **buffer_data);
+            buffer_id *buffer, void **buffer_data, sp<NativeHandle> *native_handle);
 
     virtual status_t allocateBufferWithBackup(
             node_id node, OMX_U32 port_index, const sp<IMemory> &params,
-            buffer_id *buffer, OMX_U32 allottedSize, OMX_BOOL crossProcess);
+            buffer_id *buffer, OMX_U32 allottedSize);
 
     virtual status_t freeBuffer(
             node_id node, OMX_U32 port_index, buffer_id buffer);
@@ -166,13 +172,13 @@ private:
 
     Mutex mLock;
     OMXMaster *mMaster;
-    int32_t mNodeCounter;
+    size_t mNodeCounter;
 
     KeyedVector<wp<IBinder>, OMXNodeInstance *> mLiveNodes;
     KeyedVector<node_id, OMXNodeInstance *> mNodeIDToInstance;
     KeyedVector<node_id, sp<CallbackDispatcher> > mDispatchers;
 
-    node_id makeNodeID(OMXNodeInstance *instance);
+    node_id makeNodeID_l(OMXNodeInstance *instance);
     OMXNodeInstance *findInstance(node_id node);
     sp<CallbackDispatcher> findDispatcher(node_id node);
 

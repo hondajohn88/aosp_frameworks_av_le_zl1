@@ -69,7 +69,7 @@ public:
                                    int32_t priority = 0,
                                    effect_callback_t cbf = NULL,
                                    void* user = NULL,
-                                   int sessionId = 0);
+                                   audio_session_t sessionId = AUDIO_SESSION_OUTPUT_MIX);
 
                         ~Visualizer();
 
@@ -95,8 +95,7 @@ public:
 
     // install a callback to receive periodic captures. The capture rate is specified in milliHertz
     // and the capture format is according to flags  (see callback_flags).
-    status_t setCaptureCallBack(capture_cbk_t cbk, void* user, uint32_t flags, uint32_t rate,
-                                bool force = false);
+    status_t setCaptureCallBack(capture_cbk_t cbk, void* user, uint32_t flags, uint32_t rate);
 
     // set the capture size capture size must be a power of two in the range
     // [VISUALIZER_CAPTURE_SIZE_MAX. VISUALIZER_CAPTURE_SIZE_MIN]

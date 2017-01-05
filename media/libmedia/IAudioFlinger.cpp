@@ -81,7 +81,8 @@ enum {
     LIST_AUDIO_PATCHES,
     SET_AUDIO_PORT_CONFIG,
     GET_AUDIO_HW_SYNC,
-    SYSTEM_READY
+    SYSTEM_READY,
+    FRAME_COUNT_HAL,
 };
 
 #define MAX_ITEMS_PER_LIST 1024
@@ -100,11 +101,12 @@ public:
                                 audio_format_t format,
                                 audio_channel_mask_t channelMask,
                                 size_t *pFrameCount,
-                                track_flags_t *flags,
+                                audio_output_flags_t *flags,
                                 const sp<IMemory>& sharedBuffer,
                                 audio_io_handle_t output,
+                                pid_t pid,
                                 pid_t tid,
-                                int *sessionId,
+                                audio_session_t *sessionId,
                                 int clientUid,
                                 status_t *status)
     {
@@ -117,7 +119,7 @@ public:
         data.writeInt32(channelMask);
         size_t frameCount = pFrameCount != NULL ? *pFrameCount : 0;
         data.writeInt64(frameCount);
-        track_flags_t lFlags = flags != NULL ? *flags : (track_flags_t) TRACK_DEFAULT;
+        audio_output_flags_t lFlags = flags != NULL ? *flags : AUDIO_OUTPUT_FLAG_NONE;
         data.writeInt32(lFlags);
         // haveSharedBuffer
         if (sharedBuffer != 0) {
@@ -127,8 +129,9 @@ public:
             data.writeInt32(false);
         }
         data.writeInt32((int32_t) output);
+        data.writeInt32((int32_t) pid);
         data.writeInt32((int32_t) tid);
-        int lSessionId = AUDIO_SESSION_ALLOCATE;
+        audio_session_t lSessionId = AUDIO_SESSION_ALLOCATE;
         if (sessionId != NULL) {
             lSessionId = *sessionId;
         }
@@ -142,11 +145,11 @@ public:
             if (pFrameCount != NULL) {
                 *pFrameCount = frameCount;
             }
-            lFlags = reply.readInt32();
+            lFlags = (audio_output_flags_t)reply.readInt32();
             if (flags != NULL) {
                 *flags = lFlags;
             }
-            lSessionId = reply.readInt32();
+            lSessionId = (audio_session_t) reply.readInt32();
             if (sessionId != NULL) {
                 *sessionId = lSessionId;
             }
@@ -177,10 +180,11 @@ public:
                                 audio_channel_mask_t channelMask,
                                 const String16& opPackageName,
                                 size_t *pFrameCount,
-                                track_flags_t *flags,
+                                audio_input_flags_t *flags,
+                                pid_t pid,
                                 pid_t tid,
                                 int clientUid,
-                                int *sessionId,
+                                audio_session_t *sessionId,
                                 size_t *notificationFrames,
                                 sp<IMemory>& cblk,
                                 sp<IMemory>& buffers,
@@ -196,11 +200,12 @@ public:
         data.writeString16(opPackageName);
         size_t frameCount = pFrameCount != NULL ? *pFrameCount : 0;
         data.writeInt64(frameCount);
-        track_flags_t lFlags = flags != NULL ? *flags : (track_flags_t) TRACK_DEFAULT;
+        audio_input_flags_t lFlags = flags != NULL ? *flags : AUDIO_INPUT_FLAG_NONE;
         data.writeInt32(lFlags);
+        data.writeInt32((int32_t) pid);
         data.writeInt32((int32_t) tid);
         data.writeInt32((int32_t) clientUid);
-        int lSessionId = AUDIO_SESSION_ALLOCATE;
+        audio_session_t lSessionId = AUDIO_SESSION_ALLOCATE;
         if (sessionId != NULL) {
             lSessionId = *sessionId;
         }
@@ -216,11 +221,11 @@ public:
             if (pFrameCount != NULL) {
                 *pFrameCount = frameCount;
             }
-            lFlags = reply.readInt32();
+            lFlags = (audio_input_flags_t)reply.readInt32();
             if (flags != NULL) {
                 *flags = lFlags;
             }
-            lSessionId = reply.readInt32();
+            lSessionId = (audio_session_t) reply.readInt32();
             if (sessionId != NULL) {
                 *sessionId = lSessionId;
             }
@@ -265,14 +270,16 @@ public:
         return record;
     }
 
-    virtual uint32_t sampleRate(audio_io_handle_t output) const
+    virtual uint32_t sampleRate(audio_io_handle_t ioHandle) const
     {
         Parcel data, reply;
         data.writeInterfaceToken(IAudioFlinger::getInterfaceDescriptor());
-        data.writeInt32((int32_t) output);
+        data.writeInt32((int32_t) ioHandle);
         remote()->transact(SAMPLE_RATE, data, &reply);
         return reply.readInt32();
     }
+
+    // RESERVED for channelCount()
 
     virtual audio_format_t format(audio_io_handle_t output) const
     {
@@ -283,11 +290,11 @@ public:
         return (audio_format_t) reply.readInt32();
     }
 
-    virtual size_t frameCount(audio_io_handle_t output) const
+    virtual size_t frameCount(audio_io_handle_t ioHandle) const
     {
         Parcel data, reply;
         data.writeInterfaceToken(IAudioFlinger::getInterfaceDescriptor());
-        data.writeInt32((int32_t) output);
+        data.writeInt32((int32_t) ioHandle);
         remote()->transact(FRAME_COUNT, data, &reply);
         return reply.readInt64();
     }
@@ -612,10 +619,11 @@ public:
         return (uint32_t) reply.readInt32();
     }
 
-    virtual audio_unique_id_t newAudioUniqueId()
+    virtual audio_unique_id_t newAudioUniqueId(audio_unique_id_use_t use)
     {
         Parcel data, reply;
         data.writeInterfaceToken(IAudioFlinger::getInterfaceDescriptor());
+        data.writeInt32((int32_t) use);
         status_t status = remote()->transact(NEW_AUDIO_SESSION_ID, data, &reply);
         audio_unique_id_t id = AUDIO_SESSION_ALLOCATE;
         if (status == NO_ERROR) {
@@ -624,7 +632,7 @@ public:
         return id;
     }
 
-    virtual void acquireAudioSessionId(int audioSession, int pid)
+    virtual void acquireAudioSessionId(audio_session_t audioSession, int pid)
     {
         Parcel data, reply;
         data.writeInterfaceToken(IAudioFlinger::getInterfaceDescriptor());
@@ -633,7 +641,7 @@ public:
         remote()->transact(ACQUIRE_AUDIO_SESSION_ID, data, &reply);
     }
 
-    virtual void releaseAudioSessionId(int audioSession, int pid)
+    virtual void releaseAudioSessionId(audio_session_t audioSession, int pid)
     {
         Parcel data, reply;
         data.writeInterfaceToken(IAudioFlinger::getInterfaceDescriptor());
@@ -706,7 +714,7 @@ public:
                                     const sp<IEffectClient>& client,
                                     int32_t priority,
                                     audio_io_handle_t output,
-                                    int sessionId,
+                                    audio_session_t sessionId,
                                     const String16& opPackageName,
                                     status_t *status,
                                     int *id,
@@ -753,7 +761,7 @@ public:
         return effect;
     }
 
-    virtual status_t moveEffects(int session, audio_io_handle_t srcOutput,
+    virtual status_t moveEffects(audio_session_t session, audio_io_handle_t srcOutput,
             audio_io_handle_t dstOutput)
     {
         Parcel data, reply;
@@ -910,6 +918,18 @@ public:
         data.writeInterfaceToken(IAudioFlinger::getInterfaceDescriptor());
         return remote()->transact(SYSTEM_READY, data, &reply, IBinder::FLAG_ONEWAY);
     }
+    virtual size_t frameCountHAL(audio_io_handle_t ioHandle) const
+    {
+        Parcel data, reply;
+        data.writeInterfaceToken(IAudioFlinger::getInterfaceDescriptor());
+        data.writeInt32((int32_t) ioHandle);
+        status_t status = remote()->transact(FRAME_COUNT_HAL, data, &reply);
+        if (status != NO_ERROR) {
+            return 0;
+        }
+        return reply.readInt64();
+    }
+
 };
 
 IMPLEMENT_META_INTERFACE(AudioFlinger, "android.media.IAudioFlinger");
@@ -927,15 +947,16 @@ status_t BnAudioFlinger::onTransact(
             audio_format_t format = (audio_format_t) data.readInt32();
             audio_channel_mask_t channelMask = data.readInt32();
             size_t frameCount = data.readInt64();
-            track_flags_t flags = (track_flags_t) data.readInt32();
+            audio_output_flags_t flags = (audio_output_flags_t) data.readInt32();
             bool haveSharedBuffer = data.readInt32() != 0;
             sp<IMemory> buffer;
             if (haveSharedBuffer) {
                 buffer = interface_cast<IMemory>(data.readStrongBinder());
             }
             audio_io_handle_t output = (audio_io_handle_t) data.readInt32();
+            pid_t pid = (pid_t) data.readInt32();
             pid_t tid = (pid_t) data.readInt32();
-            int sessionId = data.readInt32();
+            audio_session_t sessionId = (audio_session_t) data.readInt32();
             int clientUid = data.readInt32();
             status_t status = NO_ERROR;
             sp<IAudioTrack> track;
@@ -946,7 +967,7 @@ status_t BnAudioFlinger::onTransact(
             } else {
                 track = createTrack(
                         (audio_stream_type_t) streamType, sampleRate, format,
-                        channelMask, &frameCount, &flags, buffer, output, tid,
+                        channelMask, &frameCount, &flags, buffer, output, pid, tid,
                         &sessionId, clientUid, &status);
                 LOG_ALWAYS_FATAL_IF((track != 0) != (status == NO_ERROR));
             }
@@ -965,17 +986,19 @@ status_t BnAudioFlinger::onTransact(
             audio_channel_mask_t channelMask = data.readInt32();
             const String16& opPackageName = data.readString16();
             size_t frameCount = data.readInt64();
-            track_flags_t flags = (track_flags_t) data.readInt32();
+            audio_input_flags_t flags = (audio_input_flags_t) data.readInt32();
+            pid_t pid = (pid_t) data.readInt32();
             pid_t tid = (pid_t) data.readInt32();
             int clientUid = data.readInt32();
-            int sessionId = data.readInt32();
+            audio_session_t sessionId = (audio_session_t) data.readInt32();
             size_t notificationFrames = data.readInt64();
             sp<IMemory> cblk;
             sp<IMemory> buffers;
             status_t status = NO_ERROR;
             sp<IAudioRecord> record = openRecord(input,
-                    sampleRate, format, channelMask, opPackageName, &frameCount, &flags, tid,
-                    clientUid, &sessionId, &notificationFrames, cblk, buffers, &status);
+                    sampleRate, format, channelMask, opPackageName, &frameCount, &flags,
+                    pid, tid, clientUid, &sessionId, &notificationFrames, cblk, buffers,
+                    &status);
             LOG_ALWAYS_FATAL_IF((record != 0) != (status == NO_ERROR));
             reply->writeInt64(frameCount);
             reply->writeInt32(flags);
@@ -992,6 +1015,9 @@ status_t BnAudioFlinger::onTransact(
             reply->writeInt32( sampleRate((audio_io_handle_t) data.readInt32()) );
             return NO_ERROR;
         } break;
+
+        // RESERVED for channelCount()
+
         case FORMAT: {
             CHECK_INTERFACE(IAudioFlinger, data, reply);
             reply->writeInt32( format((audio_io_handle_t) data.readInt32()) );
@@ -1208,19 +1234,19 @@ status_t BnAudioFlinger::onTransact(
         } break;
         case NEW_AUDIO_SESSION_ID: {
             CHECK_INTERFACE(IAudioFlinger, data, reply);
-            reply->writeInt32(newAudioUniqueId());
+            reply->writeInt32(newAudioUniqueId((audio_unique_id_use_t) data.readInt32()));
             return NO_ERROR;
         } break;
         case ACQUIRE_AUDIO_SESSION_ID: {
             CHECK_INTERFACE(IAudioFlinger, data, reply);
-            int audioSession = data.readInt32();
+            audio_session_t audioSession = (audio_session_t) data.readInt32();
             int pid = data.readInt32();
             acquireAudioSessionId(audioSession, pid);
             return NO_ERROR;
         } break;
         case RELEASE_AUDIO_SESSION_ID: {
             CHECK_INTERFACE(IAudioFlinger, data, reply);
-            int audioSession = data.readInt32();
+            audio_session_t audioSession = (audio_session_t) data.readInt32();
             int pid = data.readInt32();
             releaseAudioSessionId(audioSession, pid);
             return NO_ERROR;
@@ -1266,7 +1292,7 @@ status_t BnAudioFlinger::onTransact(
             sp<IEffectClient> client = interface_cast<IEffectClient>(data.readStrongBinder());
             int32_t priority = data.readInt32();
             audio_io_handle_t output = (audio_io_handle_t) data.readInt32();
-            int sessionId = data.readInt32();
+            audio_session_t sessionId = (audio_session_t) data.readInt32();
             const String16 opPackageName = data.readString16();
             status_t status = NO_ERROR;
             int id = 0;
@@ -1283,7 +1309,7 @@ status_t BnAudioFlinger::onTransact(
         } break;
         case MOVE_EFFECTS: {
             CHECK_INTERFACE(IAudioFlinger, data, reply);
-            int session = data.readInt32();
+            audio_session_t session = (audio_session_t) data.readInt32();
             audio_io_handle_t srcOutput = (audio_io_handle_t) data.readInt32();
             audio_io_handle_t dstOutput = (audio_io_handle_t) data.readInt32();
             reply->writeInt32(moveEffects(session, srcOutput, dstOutput));
@@ -1354,7 +1380,7 @@ status_t BnAudioFlinger::onTransact(
             CHECK_INTERFACE(IAudioFlinger, data, reply);
             struct audio_patch patch;
             data.read(&patch, sizeof(struct audio_patch));
-            audio_patch_handle_t handle = {};
+            audio_patch_handle_t handle = AUDIO_PATCH_HANDLE_NONE;
             if (data.read(&handle, sizeof(audio_patch_handle_t)) != NO_ERROR) {
                 ALOGE("b/23905951");
             }
@@ -1410,12 +1436,17 @@ status_t BnAudioFlinger::onTransact(
         } break;
         case GET_AUDIO_HW_SYNC: {
             CHECK_INTERFACE(IAudioFlinger, data, reply);
-            reply->writeInt32(getAudioHwSyncForSession((audio_session_t)data.readInt32()));
+            reply->writeInt32(getAudioHwSyncForSession((audio_session_t) data.readInt32()));
             return NO_ERROR;
         } break;
         case SYSTEM_READY: {
             CHECK_INTERFACE(IAudioFlinger, data, reply);
             systemReady();
+            return NO_ERROR;
+        } break;
+        case FRAME_COUNT_HAL: {
+            CHECK_INTERFACE(IAudioFlinger, data, reply);
+            reply->writeInt64( frameCountHAL((audio_io_handle_t) data.readInt32()) );
             return NO_ERROR;
         } break;
         default:

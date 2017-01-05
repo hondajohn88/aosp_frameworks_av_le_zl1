@@ -28,13 +28,11 @@ namespace android {
 
 AudioInputDescriptor::AudioInputDescriptor(const sp<IOProfile>& profile)
     : mIoHandle(0),
-      mDevice(AUDIO_DEVICE_NONE), mPolicyMix(NULL), mPatchHandle(0), mRefCount(0),
-      mInputSource(AUDIO_SOURCE_DEFAULT), mProfile(profile), mIsSoundTrigger(false), mId(0)
+      mDevice(AUDIO_DEVICE_NONE), mPolicyMix(NULL),
+      mProfile(profile), mPatchHandle(AUDIO_PATCH_HANDLE_NONE), mId(0)
 {
     if (profile != NULL) {
-        mSamplingRate = profile->pickSamplingRate();
-        mFormat = profile->pickFormat();
-        mChannelMask = profile->pickChannelMask();
+        profile->pickAudioProfile(mSamplingRate, mChannelMask, mFormat);
         if (profile->mGains.size() > 0) {
             profile->mGains[0]->getDefaultConfig(&mGain);
         }
@@ -50,14 +48,26 @@ void AudioInputDescriptor::setIoHandle(audio_io_handle_t ioHandle)
 audio_module_handle_t AudioInputDescriptor::getModuleHandle() const
 {
     if (mProfile == 0) {
-        return 0;
+        return AUDIO_MODULE_HANDLE_NONE;
     }
     return mProfile->getModuleHandle();
+}
+
+uint32_t AudioInputDescriptor::getOpenRefCount() const
+{
+    return mSessions.getOpenCount();
 }
 
 audio_port_handle_t AudioInputDescriptor::getId() const
 {
     return mId;
+}
+
+audio_source_t AudioInputDescriptor::inputSource() const
+{
+    // TODO: return highest priority input source
+    return mSessions.size() > 0 ? mSessions.valueAt(0)->inputSource() :
+                       AUDIO_SOURCE_DEFAULT;
 }
 
 void AudioInputDescriptor::toAudioPortConfig(struct audio_port_config *dstConfig,
@@ -78,7 +88,7 @@ void AudioInputDescriptor::toAudioPortConfig(struct audio_port_config *dstConfig
     dstConfig->type = AUDIO_PORT_TYPE_MIX;
     dstConfig->ext.mix.hw_module = getModuleHandle();
     dstConfig->ext.mix.handle = mIoHandle;
-    dstConfig->ext.mix.usecase.source = mInputSource;
+    dstConfig->ext.mix.usecase.source = inputSource();
 }
 
 void AudioInputDescriptor::toAudioPort(struct audio_port *port) const
@@ -113,6 +123,58 @@ void AudioInputDescriptor::clearPreemptedSessions()
     mPreemptedSessions.clear();
 }
 
+bool AudioInputDescriptor::isActive() const {
+    return mSessions.hasActiveSession();
+}
+
+bool AudioInputDescriptor::isSourceActive(audio_source_t source) const
+{
+    return mSessions.isSourceActive(source);
+}
+
+bool AudioInputDescriptor::isSoundTrigger() const {
+    // sound trigger and non sound trigger sessions are not mixed
+    // on a given input
+    return mSessions.valueAt(0)->isSoundTrigger();
+}
+
+sp<AudioSession> AudioInputDescriptor::getAudioSession(
+                                              audio_session_t session) const {
+    return mSessions.valueFor(session);
+}
+
+AudioSessionCollection AudioInputDescriptor::getActiveAudioSessions() const
+{
+    return mSessions.getActiveSessions();
+}
+
+status_t AudioInputDescriptor::addAudioSession(audio_session_t session,
+                         const sp<AudioSession>& audioSession) {
+    return mSessions.addSession(session, audioSession, /*AudioSessionInfoProvider*/this);
+}
+
+status_t AudioInputDescriptor::removeAudioSession(audio_session_t session) {
+    return mSessions.removeSession(session);
+}
+
+audio_patch_handle_t AudioInputDescriptor::getPatchHandle() const
+{
+    return mPatchHandle;
+}
+
+void AudioInputDescriptor::setPatchHandle(audio_patch_handle_t handle)
+{
+    mPatchHandle = handle;
+    mSessions.onSessionInfoUpdate();
+}
+
+audio_config_base_t AudioInputDescriptor::getConfig() const
+{
+    const audio_config_base_t config = { .sample_rate = mSamplingRate, .channel_mask = mChannelMask,
+            .format = mFormat };
+    return config;
+}
+
 status_t AudioInputDescriptor::dump(int fd)
 {
     const size_t SIZE = 256;
@@ -129,12 +191,10 @@ status_t AudioInputDescriptor::dump(int fd)
     result.append(buffer);
     snprintf(buffer, SIZE, " Devices %08x\n", mDevice);
     result.append(buffer);
-    snprintf(buffer, SIZE, " Ref Count %d\n", mRefCount);
-    result.append(buffer);
-    snprintf(buffer, SIZE, " Open Ref Count %d\n", mOpenRefCount);
-    result.append(buffer);
 
     write(fd, result.string(), result.size());
+
+    mSessions.dump(fd, 1);
 
     return NO_ERROR;
 }
@@ -143,10 +203,7 @@ bool AudioInputCollection::isSourceActive(audio_source_t source) const
 {
     for (size_t i = 0; i < size(); i++) {
         const sp<AudioInputDescriptor>  inputDescriptor = valueAt(i);
-        if (inputDescriptor->mRefCount == 0) {
-            continue;
-        }
-        if (inputDescriptor->mInputSource == (int)source) {
+        if (inputDescriptor->isSourceActive(source)) {
             return true;
         }
     }
@@ -165,12 +222,14 @@ sp<AudioInputDescriptor> AudioInputCollection::getInputFromId(audio_port_handle_
     return inputDesc;
 }
 
-uint32_t AudioInputCollection::activeInputsCount() const
+uint32_t AudioInputCollection::activeInputsCountOnDevices(audio_devices_t devices) const
 {
     uint32_t count = 0;
     for (size_t i = 0; i < size(); i++) {
-        const sp<AudioInputDescriptor>  desc = valueAt(i);
-        if (desc->mRefCount > 0) {
+        const sp<AudioInputDescriptor>  inputDescriptor = valueAt(i);
+        if (inputDescriptor->isActive() &&
+                ((devices == AUDIO_DEVICE_IN_DEFAULT) ||
+                 ((inputDescriptor->mDevice & devices & ~AUDIO_DEVICE_BIT_IN) != 0))) {
             count++;
         }
     }
@@ -180,9 +239,10 @@ uint32_t AudioInputCollection::activeInputsCount() const
 audio_io_handle_t AudioInputCollection::getActiveInput(bool ignoreVirtualInputs)
 {
     for (size_t i = 0; i < size(); i++) {
-        const sp<AudioInputDescriptor>  input_descriptor = valueAt(i);
-        if ((input_descriptor->mRefCount > 0)
-                && (!ignoreVirtualInputs || !is_virtual_input_device(input_descriptor->mDevice))) {
+        const sp<AudioInputDescriptor>  inputDescriptor = valueAt(i);
+        if ((inputDescriptor->isActive())
+                && (!ignoreVirtualInputs ||
+                    !is_virtual_input_device(inputDescriptor->mDevice))) {
             return keyAt(i);
         }
     }
@@ -192,7 +252,7 @@ audio_io_handle_t AudioInputCollection::getActiveInput(bool ignoreVirtualInputs)
 audio_devices_t AudioInputCollection::getSupportedDevices(audio_io_handle_t handle) const
 {
     sp<AudioInputDescriptor> inputDesc = valueFor(handle);
-    audio_devices_t devices = inputDesc->mProfile->mSupportedDevices.types();
+    audio_devices_t devices = inputDesc->mProfile->getSupportedDevicesType();
     return devices;
 }
 

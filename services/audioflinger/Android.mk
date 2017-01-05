@@ -14,6 +14,8 @@ LOCAL_SHARED_LIBRARIES := \
     liblog \
     libbinder
 
+LOCAL_CFLAGS := -Wall -Werror
+
 include $(BUILD_SHARED_LIBRARY)
 
 include $(CLEAR_VARS)
@@ -34,6 +36,7 @@ LOCAL_SRC_FILES:=               \
 LOCAL_C_INCLUDES := \
     $(TOPDIR)frameworks/av/services/audiopolicy \
     $(TOPDIR)external/sonic \
+    libcore/include \
     $(call include-path-for, audio-effects) \
     $(call include-path-for, audio-utils)
 
@@ -41,12 +44,12 @@ LOCAL_SHARED_LIBRARIES := \
     libaudioresampler \
     libaudiospdif \
     libaudioutils \
-    libcommon_time_client \
     libcutils \
     libutils \
     liblog \
     libbinder \
     libmedia \
+    libmediautils \
     libnbaio \
     libhardware \
     libhardware_legacy \
@@ -54,14 +57,16 @@ LOCAL_SHARED_LIBRARIES := \
     libpowermanager \
     libserviceutility \
     libsonic \
-    libmediautils
+    libmediautils \
+    libmemunreachable
 
 LOCAL_STATIC_LIBRARIES := \
     libcpustats \
     libmedia_helper
 
+LOCAL_MULTILIB := $(AUDIOSERVER_MULTILIB)
+
 LOCAL_MODULE:= libaudioflinger
-LOCAL_32_BIT_ONLY := true
 
 LOCAL_SRC_FILES += \
     AudioWatchdog.cpp        \
@@ -78,6 +83,8 @@ LOCAL_SRC_FILES += \
 LOCAL_CFLAGS += -DSTATE_QUEUE_INSTANTIATIONS='"StateQueueInstantiations.cpp"'
 
 LOCAL_CFLAGS += -fvisibility=hidden
+
+LOCAL_CFLAGS += -Werror -Wall
 
 include $(BUILD_SHARED_LIBRARY)
 
@@ -107,6 +114,8 @@ LOCAL_MODULE:= test-resample
 
 LOCAL_MODULE_TAGS := optional
 
+LOCAL_CFLAGS := -Werror -Wall
+
 include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
@@ -126,6 +135,11 @@ LOCAL_SHARED_LIBRARIES := \
     liblog
 
 LOCAL_MODULE := libaudioresampler
+
+LOCAL_CFLAGS := -Werror -Wall
+
+# uncomment to disable NEON on architectures that actually do support NEON, for benchmarking
+#LOCAL_CFLAGS += -DUSE_NEON=false
 
 include $(BUILD_SHARED_LIBRARY)
 

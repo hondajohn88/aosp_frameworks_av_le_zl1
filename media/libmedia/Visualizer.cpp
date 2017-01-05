@@ -38,7 +38,7 @@ Visualizer::Visualizer (const String16& opPackageName,
          int32_t priority,
          effect_callback_t cbf,
          void* user,
-         int sessionId)
+         audio_session_t sessionId)
     :   AudioEffect(SL_IID_VISUALIZATION, opPackageName, NULL, priority, cbf, user, sessionId),
         mCaptureRate(CAPTURE_RATE_DEF),
         mCaptureSize(CAPTURE_SIZE_DEF),
@@ -55,7 +55,7 @@ Visualizer::~Visualizer()
 {
     ALOGV("Visualizer::~Visualizer()");
     setEnabled(false);
-    setCaptureCallBack(NULL, NULL, 0, 0, true);
+    setCaptureCallBack(NULL, NULL, 0, 0);
 }
 
 status_t Visualizer::setEnabled(bool enabled)
@@ -77,13 +77,11 @@ status_t Visualizer::setEnabled(bool enabled)
 
     status_t status = AudioEffect::setEnabled(enabled);
 
-    if (status == NO_ERROR) {
-        if (t != 0) {
-            if (enabled) {
-                t->run("Visualizer");
-            } else {
-                t->requestExit();
-            }
+    if (t != 0) {
+        if (enabled && status == NO_ERROR) {
+            t->run("Visualizer");
+        } else {
+            t->requestExit();
         }
     }
 
@@ -95,14 +93,14 @@ status_t Visualizer::setEnabled(bool enabled)
 }
 
 status_t Visualizer::setCaptureCallBack(capture_cbk_t cbk, void* user, uint32_t flags,
-        uint32_t rate, bool force)
+        uint32_t rate)
 {
     if (rate > CAPTURE_RATE_MAX) {
         return BAD_VALUE;
     }
     Mutex::Autolock _l(mCaptureLock);
 
-    if (force || mEnabled) {
+    if (mEnabled) {
         return INVALID_OPERATION;
     }
 

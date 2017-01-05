@@ -31,7 +31,7 @@ namespace android {
 
 /*static*/ const FastCaptureState FastCapture::sInitial;
 
-FastCapture::FastCapture() : FastThread(),
+FastCapture::FastCapture() : FastThread("cycleC_ms", "loadC_us"),
     mInputSource(NULL), mInputSourceGen(0), mPipeSink(NULL), mPipeSinkGen(0),
     mReadBuffer(NULL), mReadBufferState(-1), mFormat(Format_Invalid), mSampleRate(0),
     // mDummyDumpState
@@ -104,8 +104,10 @@ void FastCapture::onStateChange()
         } else {
             mFormat = mInputSource->format();
             mSampleRate = Format_sampleRate(mFormat);
+#if !LOG_NDEBUG
             unsigned channelCount = Format_channelCount(mFormat);
             ALOG_ASSERT(channelCount >= 1 && channelCount <= FCC_8);
+#endif
         }
         dumpState->mSampleRate = mSampleRate;
         eitherChanged = true;
@@ -166,8 +168,7 @@ void FastCapture::onWork()
         ALOG_ASSERT(mReadBuffer != NULL);
         dumpState->mReadSequence++;
         ATRACE_BEGIN("read");
-        ssize_t framesRead = mInputSource->read(mReadBuffer, frameCount,
-                AudioBufferProvider::kInvalidPTS);
+        ssize_t framesRead = mInputSource->read(mReadBuffer, frameCount);
         ATRACE_END();
         dumpState->mReadSequence++;
         if (framesRead >= 0) {
@@ -187,7 +188,6 @@ void FastCapture::onWork()
         ALOG_ASSERT(mPipeSink != NULL);
         ALOG_ASSERT(mReadBuffer != NULL);
         if (mReadBufferState < 0) {
-            unsigned channelCount = Format_channelCount(mFormat);
             memset(mReadBuffer, 0, frameCount * Format_frameSize(mFormat));
             mReadBufferState = frameCount;
         }

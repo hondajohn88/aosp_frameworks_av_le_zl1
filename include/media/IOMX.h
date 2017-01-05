@@ -37,6 +37,7 @@ namespace android {
 class IMemory;
 class IOMXObserver;
 class IOMXRenderer;
+class NativeHandle;
 class Surface;
 
 class IOMX : public IInterface {
@@ -59,6 +60,7 @@ public:
 
     virtual status_t allocateNode(
             const char *name, const sp<IOMXObserver> &observer,
+            sp<IBinder> *nodeBinder,
             node_id *node) = 0;
 
     virtual status_t freeNode(node_id node) = 0;
@@ -98,8 +100,8 @@ public:
             node_id node, OMX_U32 portIndex, OMX_BOOL tunneled,
             OMX_U32 audioHwSync, native_handle_t **sidebandHandle) = 0;
 
-    virtual status_t enableGraphicBuffers(
-            node_id node, OMX_U32 port_index, OMX_BOOL enable) = 0;
+    virtual status_t enableNativeBuffers(
+            node_id node, OMX_U32 port_index, OMX_BOOL graphic, OMX_BOOL enable) = 0;
 
     virtual status_t getGraphicBufferUsage(
             node_id node, OMX_U32 port_index, OMX_U32* usage) = 0;
@@ -107,7 +109,7 @@ public:
     // Use |params| as an OMX buffer, but limit the size of the OMX buffer to |allottedSize|.
     virtual status_t useBuffer(
             node_id node, OMX_U32 port_index, const sp<IMemory> &params,
-            buffer_id *buffer, OMX_U32 allottedSize, OMX_BOOL crossProcess = OMX_FALSE) = 0;
+            buffer_id *buffer, OMX_U32 allottedSize) = 0;
 
     virtual status_t useGraphicBuffer(
             node_id node, OMX_U32 port_index,
@@ -117,10 +119,14 @@ public:
             node_id node, OMX_U32 port_index,
             const sp<GraphicBuffer> &graphicBuffer, buffer_id buffer) = 0;
 
+    virtual status_t updateNativeHandleInMeta(
+            node_id node, OMX_U32 port_index,
+            const sp<NativeHandle> &nativeHandle, buffer_id buffer) = 0;
+
     // This will set *type to resulting metadata buffer type on OMX error (not on binder error) as
     // well as on success.
     virtual status_t createInputSurface(
-            node_id node, OMX_U32 port_index,
+            node_id node, OMX_U32 port_index, android_dataspace dataSpace,
             sp<IGraphicBufferProducer> *bufferProducer,
             MetadataBufferType *type = NULL) = 0;
 
@@ -137,19 +143,20 @@ public:
 
     virtual status_t signalEndOfInputStream(node_id node) = 0;
 
-    // This API clearly only makes sense if the caller lives in the
-    // same process as the callee, i.e. is the media_server, as the
-    // returned "buffer_data" pointer is just that, a pointer into local
-    // address space.
-    virtual status_t allocateBuffer(
+    // Allocate an opaque buffer as a native handle. If component supports returning native
+    // handles, those are returned in *native_handle. Otherwise, the allocated buffer is
+    // returned in *buffer_data. This clearly only makes sense if the caller lives in the
+    // same process as the callee, i.e. is the media_server, as the returned "buffer_data"
+    // pointer is just that, a pointer into local address space.
+    virtual status_t allocateSecureBuffer(
             node_id node, OMX_U32 port_index, size_t size,
-            buffer_id *buffer, void **buffer_data) = 0;
+            buffer_id *buffer, void **buffer_data, sp<NativeHandle> *native_handle) = 0;
 
     // Allocate an OMX buffer of size |allotedSize|. Use |params| as the backup buffer, which
     // may be larger.
     virtual status_t allocateBufferWithBackup(
             node_id node, OMX_U32 port_index, const sp<IMemory> &params,
-            buffer_id *buffer, OMX_U32 allottedSize, OMX_BOOL crossProcess = OMX_FALSE) = 0;
+            buffer_id *buffer, OMX_U32 allottedSize) = 0;
 
     virtual status_t freeBuffer(
             node_id node, OMX_U32 port_index, buffer_id buffer) = 0;
@@ -184,6 +191,8 @@ public:
         INTERNAL_OPTION_MAX_FPS, // data is float
         INTERNAL_OPTION_START_TIME, // data is an int64_t
         INTERNAL_OPTION_TIME_LAPSE, // data is an int64_t[2]
+        INTERNAL_OPTION_COLOR_ASPECTS, // data is ColorAspects
+        INTERNAL_OPTION_TIME_OFFSET, // data is an int64_t
     };
     virtual status_t setInternalOption(
             node_id node,
@@ -269,17 +278,18 @@ struct CodecProfileLevel {
     OMX_U32 mLevel;
 };
 
-}  // namespace android
-
-inline static const char *asString(android::MetadataBufferType i, const char *def = "??") {
+inline static const char *asString(MetadataBufferType i, const char *def = "??") {
     using namespace android;
     switch (i) {
         case kMetadataBufferTypeCameraSource:   return "CameraSource";
         case kMetadataBufferTypeGrallocSource:  return "GrallocSource";
         case kMetadataBufferTypeANWBuffer:      return "ANWBuffer";
+        case kMetadataBufferTypeNativeHandleSource: return "NativeHandleSource";
         case kMetadataBufferTypeInvalid:        return "Invalid";
         default:                                return def;
     }
 }
+
+}  // namespace android
 
 #endif  // ANDROID_IOMX_H_

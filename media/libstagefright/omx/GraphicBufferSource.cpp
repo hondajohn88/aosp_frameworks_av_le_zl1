@@ -20,12 +20,16 @@
 //#define LOG_NDEBUG 0
 #include <utils/Log.h>
 
+#define STRINGIFY_ENUMS // for asString in HardwareAPI.h/VideoAPI.h
+
 #include "GraphicBufferSource.h"
+#include "OMXUtils.h"
 
 #include <OMX_Core.h>
 #include <OMX_IndexExt.h>
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/AMessage.h>
+#include <media/stagefright/foundation/ColorUtils.h>
 
 #include <media/hardware/MetadataBufferType.h>
 #include <ui/GraphicBuffer.h>
@@ -38,6 +42,8 @@
 namespace android {
 
 static const bool EXTRA_CHECK = true;
+
+static const OMX_U32 kPortIndexInput = 0;
 
 GraphicBufferSource::PersistentProxyListener::PersistentProxyListener(
         const wp<IGraphicBufferConsumer> &consumer,
@@ -64,19 +70,19 @@ void GraphicBufferSource::PersistentProxyListener::onFrameAvailable(
             return;
         }
 
-        err = consumer->detachBuffer(bi.mBuf);
+        err = consumer->detachBuffer(bi.mSlot);
         if (err != OK) {
             ALOGE("PersistentProxyListener: detachBuffer failed (%d)", err);
             return;
         }
 
-        err = consumer->attachBuffer(&bi.mBuf, bi.mGraphicBuffer);
+        err = consumer->attachBuffer(&bi.mSlot, bi.mGraphicBuffer);
         if (err != OK) {
             ALOGE("PersistentProxyListener: attachBuffer failed (%d)", err);
             return;
         }
 
-        err = consumer->releaseBuffer(bi.mBuf, 0,
+        err = consumer->releaseBuffer(bi.mSlot, 0,
                 EGL_NO_DISPLAY, EGL_NO_SYNC_KHR, bi.mFence);
         if (err != OK) {
             ALOGE("PersistentProxyListener: releaseBuffer failed (%d)", err);
@@ -117,6 +123,7 @@ GraphicBufferSource::GraphicBufferSource(
     mNodeInstance(nodeInstance),
     mExecuting(false),
     mSuspended(false),
+    mLastDataSpace(HAL_DATASPACE_UNKNOWN),
     mIsPersistent(false),
     mConsumer(consumer),
     mNumFramesAvailable(0),
@@ -132,13 +139,13 @@ GraphicBufferSource::GraphicBufferSource(
     mRepeatLastFrameTimestamp(-1ll),
     mLatestBufferId(-1),
     mLatestBufferFrameNum(0),
-    mLatestBufferUseCount(0),
     mLatestBufferFence(Fence::NO_FENCE),
     mRepeatBufferDeferred(false),
     mTimePerCaptureUs(-1ll),
     mTimePerFrameUs(-1ll),
     mPrevCaptureUs(-1ll),
-    mPrevFrameUs(-1ll) {
+    mPrevFrameUs(-1ll),
+    mInputBufferTimeOffsetUs(0ll) {
 
     ALOGV("GraphicBufferSource w=%u h=%u c=%u",
             bufferWidth, bufferHeight, bufferCount);
@@ -189,6 +196,8 @@ GraphicBufferSource::GraphicBufferSource(
         return;
     }
 
+    memset(&mColorAspects, 0, sizeof(mColorAspects));
+
     CHECK(mInitCheck == NO_ERROR);
 }
 
@@ -215,6 +224,8 @@ void GraphicBufferSource::omxExecuting() {
             mNumFramesAvailable, mCodecBuffers.size());
     CHECK(!mExecuting);
     mExecuting = true;
+    mLastDataSpace = HAL_DATASPACE_UNKNOWN;
+    ALOGV("clearing last dataSpace");
 
     // Start by loading up as many buffers as possible.  We want to do this,
     // rather than just submit the first buffer, to avoid a degenerate case:
@@ -382,16 +393,20 @@ void GraphicBufferSource::codecBufferEmptied(OMX_BUFFERHEADERTYPE* header, int f
     // Find matching entry in our cached copy of the BufferQueue slots.
     // If we find a match, release that slot.  If we don't, the BufferQueue
     // has dropped that GraphicBuffer, and there's nothing for us to release.
-    int id = codecBuffer.mBuf;
+    int id = codecBuffer.mSlot;
     sp<Fence> fence = new Fence(fenceFd);
     if (mBufferSlot[id] != NULL &&
         mBufferSlot[id]->handle == codecBuffer.mGraphicBuffer->handle) {
-        ALOGV("cbi %d matches bq slot %d, handle=%p",
-                cbi, id, mBufferSlot[id]->handle);
+        mBufferUseCount[id]--;
 
-        if (id == mLatestBufferId) {
-            CHECK_GT(mLatestBufferUseCount--, 0);
-        } else {
+        ALOGV("codecBufferEmptied: slot=%d, cbi=%d, useCount=%d, handle=%p",
+                id, cbi, mBufferUseCount[id], mBufferSlot[id]->handle);
+
+        if (mBufferUseCount[id] < 0) {
+            ALOGW("mBufferUseCount for bq slot %d < 0 (=%d)", id, mBufferUseCount[id]);
+            mBufferUseCount[id] = 0;
+        }
+        if (id != mLatestBufferId && mBufferUseCount[id] == 0) {
             releaseBuffer(id, codecBuffer.mFrameNumber, mBufferSlot[id], fence);
         }
     } else {
@@ -476,7 +491,7 @@ void GraphicBufferSource::suspend(bool suspend) {
             ++mNumBufferAcquired;
             --mNumFramesAvailable;
 
-            releaseBuffer(item.mBuf, item.mFrameNumber,
+            releaseBuffer(item.mSlot, item.mFrameNumber,
                     item.mGraphicBuffer, item.mFence);
         }
         return;
@@ -492,6 +507,76 @@ void GraphicBufferSource::suspend(bool suspend) {
         } else {
             ALOGV("suspend/deferred repeatLatestBuffer_l FAILURE");
         }
+    }
+}
+
+void GraphicBufferSource::onDataSpaceChanged_l(
+        android_dataspace dataSpace, android_pixel_format pixelFormat) {
+    ALOGD("got buffer with new dataSpace #%x", dataSpace);
+    mLastDataSpace = dataSpace;
+
+    if (ColorUtils::convertDataSpaceToV0(dataSpace)) {
+        ColorAspects aspects = mColorAspects; // initially requested aspects
+
+        // request color aspects to encode
+        OMX_INDEXTYPE index;
+        status_t err = mNodeInstance->getExtensionIndex(
+                "OMX.google.android.index.describeColorAspects", &index);
+        if (err == OK) {
+            // V0 dataspace
+            DescribeColorAspectsParams params;
+            InitOMXParams(&params);
+            params.nPortIndex = kPortIndexInput;
+            params.nDataSpace = mLastDataSpace;
+            params.nPixelFormat = pixelFormat;
+            params.bDataSpaceChanged = OMX_TRUE;
+            params.sAspects = mColorAspects;
+
+            err = mNodeInstance->getConfig(index, &params, sizeof(params));
+            if (err == OK) {
+                aspects = params.sAspects;
+                ALOGD("Codec resolved it to (R:%d(%s), P:%d(%s), M:%d(%s), T:%d(%s)) err=%d(%s)",
+                        params.sAspects.mRange, asString(params.sAspects.mRange),
+                        params.sAspects.mPrimaries, asString(params.sAspects.mPrimaries),
+                        params.sAspects.mMatrixCoeffs, asString(params.sAspects.mMatrixCoeffs),
+                        params.sAspects.mTransfer, asString(params.sAspects.mTransfer),
+                        err, asString(err));
+            } else {
+                params.sAspects = aspects;
+                err = OK;
+            }
+            params.bDataSpaceChanged = OMX_FALSE;
+            for (int triesLeft = 2; --triesLeft >= 0; ) {
+                status_t err = mNodeInstance->setConfig(index, &params, sizeof(params));
+                if (err == OK) {
+                    err = mNodeInstance->getConfig(index, &params, sizeof(params));
+                }
+                if (err != OK || !ColorUtils::checkIfAspectsChangedAndUnspecifyThem(
+                        params.sAspects, aspects)) {
+                    // if we can't set or get color aspects, still communicate dataspace to client
+                    break;
+                }
+
+                ALOGW_IF(triesLeft == 0, "Codec repeatedly changed requested ColorAspects.");
+            }
+        }
+
+        ALOGV("Set color aspects to (R:%d(%s), P:%d(%s), M:%d(%s), T:%d(%s)) err=%d(%s)",
+                aspects.mRange, asString(aspects.mRange),
+                aspects.mPrimaries, asString(aspects.mPrimaries),
+                aspects.mMatrixCoeffs, asString(aspects.mMatrixCoeffs),
+                aspects.mTransfer, asString(aspects.mTransfer),
+                err, asString(err));
+
+        // signal client that the dataspace has changed; this will update the output format
+        // TODO: we should tie this to an output buffer somehow, and signal the change
+        // just before the output buffer is returned to the client, but there are many
+        // ways this could fail (e.g. flushing), and we are not yet supporting this scenario.
+
+        mNodeInstance->signalEvent(
+                OMX_EventDataSpaceChanged, dataSpace,
+                (aspects.mRange << 24) | (aspects.mPrimaries << 16)
+                        | (aspects.mMatrixCoeffs << 8) | aspects.mTransfer);
     }
 }
 
@@ -530,9 +615,16 @@ bool GraphicBufferSource::fillCodecBuffer_l() {
     // If this is the first time we're seeing this buffer, add it to our
     // slot table.
     if (item.mGraphicBuffer != NULL) {
-        ALOGV("fillCodecBuffer_l: setting mBufferSlot %d", item.mBuf);
-        mBufferSlot[item.mBuf] = item.mGraphicBuffer;
+        ALOGV("fillCodecBuffer_l: setting mBufferSlot %d", item.mSlot);
+        mBufferSlot[item.mSlot] = item.mGraphicBuffer;
+        mBufferUseCount[item.mSlot] = 0;
     }
+
+    if (item.mDataSpace != mLastDataSpace) {
+        onDataSpaceChanged_l(
+                item.mDataSpace, (android_pixel_format)mBufferSlot[item.mSlot]->getPixelFormat());
+    }
+
 
     err = UNKNOWN_ERROR;
 
@@ -557,10 +649,10 @@ bool GraphicBufferSource::fillCodecBuffer_l() {
     }
 
     if (err != OK) {
-        ALOGV("submitBuffer_l failed, releasing bq buf %d", item.mBuf);
-        releaseBuffer(item.mBuf, item.mFrameNumber, item.mGraphicBuffer, item.mFence);
+        ALOGV("submitBuffer_l failed, releasing bq slot %d", item.mSlot);
+        releaseBuffer(item.mSlot, item.mFrameNumber, item.mGraphicBuffer, item.mFence);
     } else {
-        ALOGV("buffer submitted (bq %d, cbi %d)", item.mBuf, cbi);
+        ALOGV("buffer submitted (bq %d, cbi %d)", item.mSlot, cbi);
         setLatestBuffer_l(item, dropped);
     }
 
@@ -600,7 +692,7 @@ bool GraphicBufferSource::repeatLatestBuffer_l() {
     }
 
     BufferItem item;
-    item.mBuf = mLatestBufferId;
+    item.mSlot = mLatestBufferId;
     item.mFrameNumber = mLatestBufferFrameNum;
     item.mTimestamp = mRepeatLastFrameTimestamp;
     item.mFence = mLatestBufferFence;
@@ -611,7 +703,7 @@ bool GraphicBufferSource::repeatLatestBuffer_l() {
         return false;
     }
 
-    ++mLatestBufferUseCount;
+    ++mBufferUseCount[item.mSlot];
 
     /* repeat last frame up to kRepeatLastFrameCount times.
      * in case of static scene, a single repeat might not get rid of encoder
@@ -632,21 +724,25 @@ bool GraphicBufferSource::repeatLatestBuffer_l() {
 
 void GraphicBufferSource::setLatestBuffer_l(
         const BufferItem &item, bool dropped) {
-    ALOGV("setLatestBuffer_l");
-
     if (mLatestBufferId >= 0) {
-        if (mLatestBufferUseCount == 0) {
+        if (mBufferUseCount[mLatestBufferId] == 0) {
             releaseBuffer(mLatestBufferId, mLatestBufferFrameNum,
                     mBufferSlot[mLatestBufferId], mLatestBufferFence);
             // mLatestBufferFence will be set to new fence just below
         }
     }
 
-    mLatestBufferId = item.mBuf;
+    mLatestBufferId = item.mSlot;
     mLatestBufferFrameNum = item.mFrameNumber;
     mRepeatLastFrameTimestamp = item.mTimestamp + mRepeatAfterUs * 1000;
 
-    mLatestBufferUseCount = dropped ? 0 : 1;
+    if (!dropped) {
+        ++mBufferUseCount[item.mSlot];
+    }
+
+    ALOGV("setLatestBuffer_l: slot=%d, useCount=%d",
+            item.mSlot, mBufferUseCount[item.mSlot]);
+
     mRepeatBufferDeferred = false;
     mRepeatLastFrameCount = kRepeatLastFrameCount;
     mLatestBufferFence = item.mFence;
@@ -687,8 +783,11 @@ status_t GraphicBufferSource::signalEndOfInputStream() {
 
 int64_t GraphicBufferSource::getTimestamp(const BufferItem &item) {
     int64_t timeUs = item.mTimestamp / 1000;
+    timeUs += mInputBufferTimeOffsetUs;
 
-    if (mTimePerCaptureUs > 0ll) {
+    if (mTimePerCaptureUs > 0ll
+            && (mTimePerCaptureUs > 2 * mTimePerFrameUs
+            || mTimePerFrameUs > 2 * mTimePerCaptureUs)) {
         // Time lapse or slow motion mode
         if (mPrevCaptureUs < 0ll) {
             // first capture
@@ -713,40 +812,45 @@ int64_t GraphicBufferSource::getTimestamp(const BufferItem &item) {
                 static_cast<long long>(mPrevFrameUs));
 
         return mPrevFrameUs;
-    } else if (mMaxTimestampGapUs > 0ll) {
-        /* Cap timestamp gap between adjacent frames to specified max
-         *
-         * In the scenario of cast mirroring, encoding could be suspended for
-         * prolonged periods. Limiting the pts gap to workaround the problem
-         * where encoder's rate control logic produces huge frames after a
-         * long period of suspension.
-         */
-
+    } else {
         int64_t originalTimeUs = timeUs;
-        if (mPrevOriginalTimeUs >= 0ll) {
-            if (originalTimeUs < mPrevOriginalTimeUs) {
+        if (originalTimeUs <= mPrevOriginalTimeUs) {
                 // Drop the frame if it's going backward in time. Bad timestamp
                 // could disrupt encoder's rate control completely.
-                ALOGW("Dropping frame that's going backward in time");
-                return -1;
-            }
-            int64_t timestampGapUs = originalTimeUs - mPrevOriginalTimeUs;
-            timeUs = (timestampGapUs < mMaxTimestampGapUs ?
-                    timestampGapUs : mMaxTimestampGapUs) + mPrevModifiedTimeUs;
+            ALOGW("Dropping frame that's going backward in time");
+            return -1;
         }
+
+        if (mMaxTimestampGapUs > 0ll) {
+            //TODO: Fix the case when mMaxTimestampGapUs and mTimePerCaptureUs are both set.
+
+            /* Cap timestamp gap between adjacent frames to specified max
+             *
+             * In the scenario of cast mirroring, encoding could be suspended for
+             * prolonged periods. Limiting the pts gap to workaround the problem
+             * where encoder's rate control logic produces huge frames after a
+             * long period of suspension.
+             */
+            if (mPrevOriginalTimeUs >= 0ll) {
+                int64_t timestampGapUs = originalTimeUs - mPrevOriginalTimeUs;
+                timeUs = (timestampGapUs < mMaxTimestampGapUs ?
+                    timestampGapUs : mMaxTimestampGapUs) + mPrevModifiedTimeUs;
+            }
+            mOriginalTimeUs.add(timeUs, originalTimeUs);
+            ALOGV("IN  timestamp: %lld -> %lld",
+                static_cast<long long>(originalTimeUs),
+                static_cast<long long>(timeUs));
+        }
+
         mPrevOriginalTimeUs = originalTimeUs;
         mPrevModifiedTimeUs = timeUs;
-        mOriginalTimeUs.add(timeUs, originalTimeUs);
-        ALOGV("IN  timestamp: %lld -> %lld",
-            static_cast<long long>(originalTimeUs),
-            static_cast<long long>(timeUs));
     }
 
     return timeUs;
 }
 
 status_t GraphicBufferSource::submitBuffer_l(const BufferItem &item, int cbi) {
-    ALOGV("submitBuffer_l cbi=%d", cbi);
+    ALOGV("submitBuffer_l: slot=%d, cbi=%d", item.mSlot, cbi);
 
     int64_t timeUs = getTimestamp(item);
     if (timeUs < 0ll) {
@@ -754,8 +858,8 @@ status_t GraphicBufferSource::submitBuffer_l(const BufferItem &item, int cbi) {
     }
 
     CodecBuffer& codecBuffer(mCodecBuffers.editItemAt(cbi));
-    codecBuffer.mGraphicBuffer = mBufferSlot[item.mBuf];
-    codecBuffer.mBuf = item.mBuf;
+    codecBuffer.mGraphicBuffer = mBufferSlot[item.mSlot];
+    codecBuffer.mSlot = item.mSlot;
     codecBuffer.mFrameNumber = item.mFrameNumber;
 
     OMX_BUFFERHEADERTYPE* header = codecBuffer.mHeader;
@@ -839,6 +943,7 @@ int GraphicBufferSource::findMatchingCodecBuffer_l(
 void GraphicBufferSource::releaseBuffer(
         int &id, uint64_t frameNum,
         const sp<GraphicBuffer> buffer, const sp<Fence> &fence) {
+    ALOGV("releaseBuffer: slot=%d", id);
     if (mIsPersistent) {
         mConsumer->detachBuffer(id);
         mBufferSlot[id] = NULL;
@@ -880,11 +985,12 @@ void GraphicBufferSource::onFrameAvailable(const BufferItem& /*item*/) {
             // If this is the first time we're seeing this buffer, add it to our
             // slot table.
             if (item.mGraphicBuffer != NULL) {
-                ALOGV("onFrameAvailable: setting mBufferSlot %d", item.mBuf);
-                mBufferSlot[item.mBuf] = item.mGraphicBuffer;
+                ALOGV("onFrameAvailable: setting mBufferSlot %d", item.mSlot);
+                mBufferSlot[item.mSlot] = item.mGraphicBuffer;
+                mBufferUseCount[item.mSlot] = 0;
             }
 
-            releaseBuffer(item.mBuf, item.mFrameNumber,
+            releaseBuffer(item.mSlot, item.mFrameNumber,
                     item.mGraphicBuffer, item.mFence);
         }
         return;
@@ -915,6 +1021,7 @@ void GraphicBufferSource::onBuffersReleased() {
     for (int i = 0; i < BufferQueue::NUM_BUFFER_SLOTS; i++) {
         if ((slotMask & 0x01) != 0) {
             mBufferSlot[i] = NULL;
+            mBufferUseCount[i] = 0;
         }
         slotMask >>= 1;
     }
@@ -923,6 +1030,13 @@ void GraphicBufferSource::onBuffersReleased() {
 // BufferQueue::ConsumerListener callback
 void GraphicBufferSource::onSidebandStreamChanged() {
     ALOG_ASSERT(false, "GraphicBufferSource can't consume sideband streams");
+}
+
+void GraphicBufferSource::setDefaultDataSpace(android_dataspace dataSpace) {
+    // no need for mutex as we are not yet running
+    ALOGD("setting dataspace: %#x", dataSpace);
+    mConsumer->setDefaultBufferDataSpace(dataSpace);
+    mLastDataSpace = dataSpace;
 }
 
 status_t GraphicBufferSource::setRepeatPreviousFrameDelayUs(
@@ -950,6 +1064,18 @@ status_t GraphicBufferSource::setMaxTimestampGapUs(int64_t maxGapUs) {
     return OK;
 }
 
+status_t GraphicBufferSource::setInputBufferTimeOffset(int64_t timeOffsetUs) {
+    Mutex::Autolock autoLock(mMutex);
+
+    // timeOffsetUs must be negative for adjustment.
+    if (timeOffsetUs >= 0ll) {
+        return INVALID_OPERATION;
+    }
+
+    mInputBufferTimeOffsetUs = timeOffsetUs;
+    return OK;
+}
+
 status_t GraphicBufferSource::setMaxFps(float maxFps) {
     Mutex::Autolock autoLock(mMutex);
 
@@ -974,17 +1100,27 @@ void GraphicBufferSource::setSkipFramesBeforeUs(int64_t skipFramesBeforeUs) {
             (skipFramesBeforeUs > 0) ? (skipFramesBeforeUs * 1000) : -1ll;
 }
 
-status_t GraphicBufferSource::setTimeLapseUs(int64_t* data) {
+status_t GraphicBufferSource::setTimeLapseConfig(const TimeLapseConfig &config) {
     Mutex::Autolock autoLock(mMutex);
 
-    if (mExecuting || data[0] <= 0ll || data[1] <= 0ll) {
+    if (mExecuting || config.mTimePerFrameUs <= 0ll || config.mTimePerCaptureUs <= 0ll) {
         return INVALID_OPERATION;
     }
 
-    mTimePerFrameUs = data[0];
-    mTimePerCaptureUs = data[1];
+    mTimePerFrameUs = config.mTimePerFrameUs;
+    mTimePerCaptureUs = config.mTimePerCaptureUs;
 
     return OK;
+}
+
+void GraphicBufferSource::setColorAspects(const ColorAspects &aspects) {
+    Mutex::Autolock autoLock(mMutex);
+    mColorAspects = aspects;
+    ALOGD("requesting color aspects (R:%d(%s), P:%d(%s), M:%d(%s), T:%d(%s))",
+            aspects.mRange, asString(aspects.mRange),
+            aspects.mPrimaries, asString(aspects.mPrimaries),
+            aspects.mMatrixCoeffs, asString(aspects.mMatrixCoeffs),
+            aspects.mTransfer, asString(aspects.mTransfer));
 }
 
 void GraphicBufferSource::onMessageReceived(const sp<AMessage> &msg) {

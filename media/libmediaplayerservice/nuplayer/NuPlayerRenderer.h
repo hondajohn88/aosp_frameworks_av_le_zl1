@@ -92,8 +92,9 @@ struct NuPlayer::Renderer : public AHandler {
     };
 
     enum AudioTearDownReason {
-        kDueToError = 0,
+        kDueToError = 0,   // Could restart with either offload or non-offload.
         kDueToTimeout,
+        kForceNonOffload,  // Restart only with non-offload.
     };
 
 protected:
@@ -134,6 +135,7 @@ private:
     static const int64_t kMinPositionUpdateDelayUs;
 
     sp<MediaPlayerBase::AudioSink> mAudioSink;
+    bool mUseVirtualAudioSink;
     sp<AMessage> mNotify;
     Mutex mLock;
     uint32_t mFlags;
@@ -148,6 +150,7 @@ private:
     int32_t mVideoQueueGeneration;
     int32_t mAudioDrainGeneration;
     int32_t mVideoDrainGeneration;
+    int32_t mAudioEOSGeneration;
 
     sp<MediaClock> mMediaClock;
     float mPlaybackRate; // audio track rate
@@ -178,7 +181,9 @@ private:
     int32_t mAudioRenderingStartGeneration;
     bool mRenderingDataDelivered;
 
-    int64_t mLastPositionUpdateUs;
+    int64_t mNextAudioClockUpdateTimeUs;
+    // the media timestamp of last audio sample right before EOS.
+    int64_t mLastAudioMediaTimeUs;
 
     int32_t mAudioOffloadPauseTimeoutGeneration;
     bool mAudioTornDown;
@@ -207,12 +212,12 @@ private:
     status_t getCurrentPositionFromAnchor(
             int64_t *mediaUs, int64_t nowUs, bool allowPastQueuedVideo = false);
 
+    void notifyEOSCallback();
     size_t fillAudioBuffer(void *buffer, size_t size);
 
     bool onDrainAudioQueue();
     void drainAudioQueueUntilLastEOS();
     int64_t getPendingAudioPlayoutDurationUs(int64_t nowUs);
-    int64_t getPlayedOutAudioDurationUs(int64_t nowUs);
     void postDrainAudioQueue_l(int64_t delayUs = 0);
 
     void clearAnchorTime_l();
@@ -259,7 +264,7 @@ private:
     void notifyPosition();
     void notifyVideoLateBy(int64_t lateByUs);
     void notifyVideoRenderingStart();
-    void notifyAudioTearDown();
+    void notifyAudioTearDown(AudioTearDownReason reason);
 
     void flushQueue(List<QueueEntry> *queue);
     bool dropBufferIfStale(bool audio, const sp<AMessage> &msg);

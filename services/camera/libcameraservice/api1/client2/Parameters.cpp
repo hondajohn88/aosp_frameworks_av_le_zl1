@@ -30,6 +30,7 @@
 #include "Parameters.h"
 #include "system/camera.h"
 #include "hardware/camera_common.h"
+#include <android/hardware/ICamera.h>
 #include <media/MediaProfiles.h>
 #include <media/mediarecorder.h>
 
@@ -237,6 +238,10 @@ status_t Parameters::initialize(const CameraMetadata *info, int deviceVersion) {
     {
         String8 supportedPreviewFpsRange;
         for (size_t i=0; i < availableFpsRanges.count; i += 2) {
+            if (!isFpsSupported(availablePreviewSizes,
+                HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, availableFpsRanges.data.i32[i+1])) {
+                continue;
+            }
             if (i != 0) supportedPreviewFpsRange += ",";
             supportedPreviewFpsRange += String8::format("(%d,%d)",
                     availableFpsRanges.data.i32[i] * kFpsToApiScale,
@@ -254,7 +259,10 @@ status_t Parameters::initialize(const CameraMetadata *info, int deviceVersion) {
             // from the [min, max] fps range use the max value
             int fps = fpsFromRange(availableFpsRanges.data.i32[i],
                                    availableFpsRanges.data.i32[i+1]);
-
+            if (!isFpsSupported(availablePreviewSizes,
+                    HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, fps)) {
+                continue;
+            }
             // de-dupe frame rates
             if (sortedPreviewFrameRates.indexOf(fps) == NAME_NOT_FOUND) {
                 sortedPreviewFrameRates.add(fps);
@@ -870,8 +878,9 @@ status_t Parameters::initialize(const CameraMetadata *info, int deviceVersion) {
     }
 
     // Set up initial state for non-Camera.Parameters state variables
-
-    storeMetadataInBuffers = true;
+    videoFormat = HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED;
+    videoDataSpace = HAL_DATASPACE_V0_BT709;
+    videoBufferMode = hardware::ICamera::VIDEO_BUFFER_MODE_DATA_CALLBACK_YUV;
     playShutterSound = true;
     enableFaceDetect = false;
 
@@ -906,14 +915,12 @@ status_t Parameters::initialize(const CameraMetadata *info, int deviceVersion) {
     property_get("camera.disable_zsl_mode", value, "0");
     if (!strcmp(value,"1") || slowJpegMode) {
         ALOGI("Camera %d: Disabling ZSL mode", cameraId);
-        zslMode = false;
+        allowZslMode = false;
     } else {
-        zslMode = true;
+        allowZslMode = true;
     }
 
-    ALOGI("%s: zslMode: %d slowJpegMode %d", __FUNCTION__, zslMode, slowJpegMode);
-
-    lightFx = LIGHTFX_NONE;
+    ALOGI("%s: allowZslMode: %d slowJpegMode %d", __FUNCTION__, allowZslMode, slowJpegMode);
 
     state = STOPPED;
 
@@ -951,21 +958,40 @@ status_t Parameters::buildFastInfo() {
         return NO_INIT;
     }
 
+    // Get supported preview fps ranges.
+    Vector<Size> supportedPreviewSizes;
+    Vector<FpsRange> supportedPreviewFpsRanges;
+    const Size PREVIEW_SIZE_BOUND = { MAX_PREVIEW_WIDTH, MAX_PREVIEW_HEIGHT };
+    status_t res = getFilteredSizes(PREVIEW_SIZE_BOUND, &supportedPreviewSizes);
+    if (res != OK) return res;
+    for (size_t i=0; i < availableFpsRanges.count; i += 2) {
+        if (!isFpsSupported(supportedPreviewSizes,
+                HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, availableFpsRanges.data.i32[i+1])) {
+            continue;
+        }
+        FpsRange fpsRange = {availableFpsRanges.data.i32[i], availableFpsRanges.data.i32[i+1]};
+        supportedPreviewFpsRanges.add(fpsRange);
+    }
+    if (supportedPreviewFpsRanges.size() == 0) {
+        ALOGE("Supported preview fps range is empty");
+        return NO_INIT;
+    }
+
     int32_t bestStillCaptureFpsRange[2] = {
-        availableFpsRanges.data.i32[0], availableFpsRanges.data.i32[1]
+        supportedPreviewFpsRanges[0].low, supportedPreviewFpsRanges[0].high
     };
     int32_t curRange =
             bestStillCaptureFpsRange[1] - bestStillCaptureFpsRange[0];
-    for (size_t i = 2; i < availableFpsRanges.count; i += 2) {
+    for (size_t i = 1; i < supportedPreviewFpsRanges.size(); i ++) {
         int32_t nextRange =
-                availableFpsRanges.data.i32[i + 1] -
-                availableFpsRanges.data.i32[i];
+                supportedPreviewFpsRanges[i].high -
+                supportedPreviewFpsRanges[i].low;
         if ( (nextRange > curRange) ||       // Maximize size of FPS range first
                 (nextRange == curRange &&    // Then minimize low-end FPS
-                 bestStillCaptureFpsRange[0] > availableFpsRanges.data.i32[i])) {
+                 bestStillCaptureFpsRange[0] > supportedPreviewFpsRanges[i].low)) {
 
-            bestStillCaptureFpsRange[0] = availableFpsRanges.data.i32[i];
-            bestStillCaptureFpsRange[1] = availableFpsRanges.data.i32[i + 1];
+            bestStillCaptureFpsRange[0] = supportedPreviewFpsRanges[i].low;
+            bestStillCaptureFpsRange[1] = supportedPreviewFpsRanges[i].high;
             curRange = nextRange;
         }
     }
@@ -1040,7 +1066,7 @@ status_t Parameters::buildFastInfo() {
             ALOGE("%s: Camera %d: Scene mode override list is an "
                     "unexpected size: %zu (expected %zu)", __FUNCTION__,
                     cameraId, sceneModeOverrides.count,
-                    availableSceneModes.count);
+                    availableSceneModes.count * kModesPerSceneMode);
             return NO_INIT;
         }
         for (size_t i = 0; i < availableSceneModes.count; i++) {
@@ -1126,6 +1152,8 @@ status_t Parameters::buildFastInfo() {
     }
     ALOGV("Camera %d: Flexible YUV %s supported",
             cameraId, fastInfo.useFlexibleYuv ? "is" : "is not");
+
+    fastInfo.maxJpegSize = getMaxSize(getAvailableJpegSizes());
 
     return OK;
 }
@@ -1864,10 +1892,6 @@ status_t Parameters::set(const String8& paramString) {
         ALOGE("%s: Video stabilization not supported", __FUNCTION__);
     }
 
-    // LIGHTFX
-    validatedParams.lightFx = lightFxStringToEnum(
-        newParams.get(CameraParameters::KEY_LIGHTFX));
-
     /** Update internal parameters */
 
     *this = validatedParams;
@@ -1959,7 +1983,7 @@ status_t Parameters::updateRequest(CameraMetadata *request) const {
     if (res != OK) return res;
 
     // android.hardware.Camera requires that when face detect is enabled, the
-    // camera is in a face-priority mode. HAL2 splits this into separate parts
+    // camera is in a face-priority mode. HAL3.x splits this into separate parts
     // (face detection statistics and face priority scene mode). Map from other
     // to the other.
     bool sceneModeActive =
@@ -2235,6 +2259,25 @@ bool Parameters::isJpegSizeOverridden() {
     return pictureSizeOverriden;
 }
 
+bool Parameters::useZeroShutterLag() const {
+    // If ZSL mode is disabled, don't use it
+    if (!allowZslMode) return false;
+    // If recording hint is enabled, don't do ZSL
+    if (recordingHint) return false;
+    // If still capture size is no bigger than preview or video size,
+    // don't do ZSL
+    if (pictureWidth <= previewWidth || pictureHeight <= previewHeight ||
+            pictureWidth <= videoWidth || pictureHeight <= videoHeight) {
+        return false;
+    }
+    // If still capture size is less than quarter of max, don't do ZSL
+    if ((pictureWidth * pictureHeight) <
+            (fastInfo.maxJpegSize.width * fastInfo.maxJpegSize.height / 4) ) {
+        return false;
+    }
+    return true;
+}
+
 const char* Parameters::getStateName(State state) {
 #define CASE_ENUM_TO_CHAR(x) case x: return(#x); break;
     switch(state) {
@@ -2499,18 +2542,6 @@ const char *Parameters::focusModeEnumToString(focusMode_t focusMode) {
                     __FUNCTION__, focusMode);
             return "unknown";
     }
-}
-
-Parameters::Parameters::lightFxMode_t Parameters::lightFxStringToEnum(
-        const char *lightFxMode) {
-    return
-        !lightFxMode ?
-            Parameters::LIGHTFX_NONE :
-        !strcmp(lightFxMode, CameraParameters::LIGHTFX_LOWLIGHT) ?
-            Parameters::LIGHTFX_LOWLIGHT :
-        !strcmp(lightFxMode, CameraParameters::LIGHTFX_HDR) ?
-            Parameters::LIGHTFX_HDR :
-        Parameters::LIGHTFX_NONE;
 }
 
 status_t Parameters::parseAreas(const char *areasCStr,
@@ -2831,22 +2862,7 @@ Vector<Parameters::StreamConfiguration> Parameters::getStreamConfigurations() {
 
 int64_t Parameters::getJpegStreamMinFrameDurationNs(Parameters::Size size) {
     if (mDeviceVersion >= CAMERA_DEVICE_API_VERSION_3_2) {
-        const int STREAM_DURATION_SIZE = 4;
-        const int STREAM_FORMAT_OFFSET = 0;
-        const int STREAM_WIDTH_OFFSET = 1;
-        const int STREAM_HEIGHT_OFFSET = 2;
-        const int STREAM_DURATION_OFFSET = 3;
-        camera_metadata_ro_entry_t availableStreamMinDurations =
-                    staticInfo(ANDROID_SCALER_AVAILABLE_MIN_FRAME_DURATIONS);
-        for (size_t i = 0; i < availableStreamMinDurations.count; i+= STREAM_DURATION_SIZE) {
-            int64_t format = availableStreamMinDurations.data.i64[i + STREAM_FORMAT_OFFSET];
-            int64_t width = availableStreamMinDurations.data.i64[i + STREAM_WIDTH_OFFSET];
-            int64_t height = availableStreamMinDurations.data.i64[i + STREAM_HEIGHT_OFFSET];
-            int64_t duration = availableStreamMinDurations.data.i64[i + STREAM_DURATION_OFFSET];
-            if (format == HAL_PIXEL_FORMAT_BLOB && width == size.width && height == size.height) {
-                return duration;
-            }
-        }
+        return getMinFrameDurationNs(size, HAL_PIXEL_FORMAT_BLOB);
     } else {
         Vector<Size> availableJpegSizes = getAvailableJpegSizes();
         size_t streamIdx = availableJpegSizes.size();
@@ -2868,6 +2884,57 @@ int64_t Parameters::getJpegStreamMinFrameDurationNs(Parameters::Size size) {
     ALOGE("%s: cannot find min frame duration for jpeg size %dx%d",
             __FUNCTION__, size.width, size.height);
     return -1;
+}
+
+int64_t Parameters::getMinFrameDurationNs(Parameters::Size size, int fmt) {
+    if (mDeviceVersion < CAMERA_DEVICE_API_VERSION_3_2) {
+        ALOGE("Min frame duration for HAL 3.1 or lower is not supported");
+        return -1;
+    }
+
+    const int STREAM_DURATION_SIZE = 4;
+    const int STREAM_FORMAT_OFFSET = 0;
+    const int STREAM_WIDTH_OFFSET = 1;
+    const int STREAM_HEIGHT_OFFSET = 2;
+    const int STREAM_DURATION_OFFSET = 3;
+    camera_metadata_ro_entry_t availableStreamMinDurations =
+                staticInfo(ANDROID_SCALER_AVAILABLE_MIN_FRAME_DURATIONS);
+    for (size_t i = 0; i < availableStreamMinDurations.count; i+= STREAM_DURATION_SIZE) {
+        int64_t format = availableStreamMinDurations.data.i64[i + STREAM_FORMAT_OFFSET];
+        int64_t width = availableStreamMinDurations.data.i64[i + STREAM_WIDTH_OFFSET];
+        int64_t height = availableStreamMinDurations.data.i64[i + STREAM_HEIGHT_OFFSET];
+        int64_t duration = availableStreamMinDurations.data.i64[i + STREAM_DURATION_OFFSET];
+        if (format == fmt && width == size.width && height == size.height) {
+            return duration;
+        }
+    }
+
+    return -1;
+}
+
+bool Parameters::isFpsSupported(const Vector<Size> &sizes, int format, int32_t fps) {
+    // Skip the check for older HAL version, as the min duration is not supported.
+    if (mDeviceVersion < CAMERA_DEVICE_API_VERSION_3_2) {
+        return true;
+    }
+
+    // Get min frame duration for each size and check if the given fps range can be supported.
+    const int32_t FPS_MARGIN = 1;
+    for (size_t i = 0 ; i < sizes.size(); i++) {
+        int64_t minFrameDuration = getMinFrameDurationNs(sizes[i], format);
+        if (minFrameDuration <= 0) {
+            ALOGE("Min frame duration (%" PRId64") for size (%dx%d) and format 0x%x is wrong!",
+                minFrameDuration, sizes[i].width, sizes[i].height, format);
+            return false;
+        }
+        int32_t maxSupportedFps = 1e9 / minFrameDuration;
+        // Add some margin here for the case where the hal supports 29.xxxfps.
+        maxSupportedFps += FPS_MARGIN;
+        if (fps > maxSupportedFps) {
+            return false;
+        }
+    }
+    return true;
 }
 
 SortedVector<int32_t> Parameters::getAvailableOutputFormats() {

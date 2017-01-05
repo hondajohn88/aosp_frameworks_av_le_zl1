@@ -56,6 +56,7 @@ SoftVorbis::SoftVorbis(
       mNumFramesLeftOnPage(-1),
       mSawInputEos(false),
       mSignalledOutputEos(false),
+      mSignalledError(false),
       mOutputPortSettingsChange(NONE) {
     initPorts();
     CHECK_EQ(initDecoder(), (status_t)OK);
@@ -83,7 +84,7 @@ void SoftVorbis::initPorts() {
     def.eDir = OMX_DirInput;
     def.nBufferCountMin = kNumBuffers;
     def.nBufferCountActual = def.nBufferCountMin;
-    def.nBufferSize = 8192;
+    def.nBufferSize = kMaxNumSamplesPerBuffer * sizeof(int16_t);
     def.bEnabled = OMX_TRUE;
     def.bPopulated = OMX_FALSE;
     def.eDomain = OMX_PortDomainAudio;
@@ -263,7 +264,7 @@ void SoftVorbis::onQueueFilled(OMX_U32 portIndex) {
     List<BufferInfo *> &inQueue = getPortQueue(0);
     List<BufferInfo *> &outQueue = getPortQueue(1);
 
-    if (mOutputPortSettingsChange != NONE) {
+    if (mSignalledError || mOutputPortSettingsChange != NONE) {
         return;
     }
 
@@ -277,6 +278,7 @@ void SoftVorbis::onQueueFilled(OMX_U32 portIndex) {
             ALOGE("Too small input buffer: %zu bytes", size);
             android_errorWriteLog(0x534e4554, "27833616");
             notify(OMX_EventError, OMX_ErrorUndefined, 0, NULL);
+            mSignalledError = true;
             return;
         }
 
@@ -293,9 +295,19 @@ void SoftVorbis::onQueueFilled(OMX_U32 portIndex) {
             mVi = new vorbis_info;
             vorbis_info_init(mVi);
 
-            CHECK_EQ(0, _vorbis_unpack_info(mVi, &bits));
+            int ret = _vorbis_unpack_info(mVi, &bits);
+            if (ret != 0) {
+                notify(OMX_EventError, OMX_ErrorUndefined, ret, NULL);
+                mSignalledError = true;
+                return;
+            }
         } else {
-            CHECK_EQ(0, _vorbis_unpack_books(mVi, &bits));
+            int ret = _vorbis_unpack_books(mVi, &bits);
+            if (ret != 0) {
+                notify(OMX_EventError, OMX_ErrorUndefined, ret, NULL);
+                mSignalledError = true;
+                return;
+            }
 
             CHECK(mState == NULL);
             mState = new vorbis_dsp_state;
@@ -333,7 +345,13 @@ void SoftVorbis::onQueueFilled(OMX_U32 portIndex) {
             }
 
             if (inHeader->nFilledLen || !mSawInputEos) {
-                CHECK_GE(inHeader->nFilledLen, sizeof(numPageSamples));
+                if (inHeader->nFilledLen < sizeof(numPageSamples)) {
+                    notify(OMX_EventError, OMX_ErrorBadParameter, 0, NULL);
+                    mSignalledError = true;
+                    ALOGE("onQueueFilled, input header has nFilledLen %u, expected %zu",
+                            inHeader->nFilledLen, sizeof(numPageSamples));
+                    return;
+                }
                 memcpy(&numPageSamples,
                        inHeader->pBuffer
                         + inHeader->nOffset + inHeader->nFilledLen - 4,
@@ -445,6 +463,9 @@ void SoftVorbis::onPortFlushCompleted(OMX_U32 portIndex) {
         // depend on fragments from the last one decoded.
 
         mNumFramesOutput = 0;
+        mSawInputEos = false;
+        mSignalledOutputEos = false;
+        mNumFramesLeftOnPage = -1;
         vorbis_dsp_restart(mState);
     }
 }
@@ -466,6 +487,7 @@ void SoftVorbis::onReset() {
 
     mSawInputEos = false;
     mSignalledOutputEos = false;
+    mSignalledError = false;
     mOutputPortSettingsChange = NONE;
 }
 

@@ -29,6 +29,11 @@
 #include <media/stagefright/DataSource.h>
 #include <media/stagefright/Utils.h>
 
+/* TODO: remove after being merged into other branches */
+#ifndef UINT32_MAX
+#define UINT32_MAX       (4294967295U)
+#endif
+
 namespace android {
 
 // static
@@ -48,14 +53,14 @@ struct SampleTable::CompositionDeltaLookup {
     CompositionDeltaLookup();
 
     void setEntries(
-            const uint32_t *deltaEntries, size_t numDeltaEntries);
+            const int32_t *deltaEntries, size_t numDeltaEntries);
 
-    uint32_t getCompositionTimeOffset(uint32_t sampleIndex);
+    int32_t getCompositionTimeOffset(uint32_t sampleIndex);
 
 private:
     Mutex mLock;
 
-    const uint32_t *mDeltaEntries;
+    const int32_t *mDeltaEntries;
     size_t mNumDeltaEntries;
 
     size_t mCurrentDeltaEntry;
@@ -72,7 +77,7 @@ SampleTable::CompositionDeltaLookup::CompositionDeltaLookup()
 }
 
 void SampleTable::CompositionDeltaLookup::setEntries(
-        const uint32_t *deltaEntries, size_t numDeltaEntries) {
+        const int32_t *deltaEntries, size_t numDeltaEntries) {
     Mutex::Autolock autolock(mLock);
 
     mDeltaEntries = deltaEntries;
@@ -81,7 +86,7 @@ void SampleTable::CompositionDeltaLookup::setEntries(
     mCurrentEntrySampleIndex = 0;
 }
 
-uint32_t SampleTable::CompositionDeltaLookup::getCompositionTimeOffset(
+int32_t SampleTable::CompositionDeltaLookup::getCompositionTimeOffset(
         uint32_t sampleIndex) {
     Mutex::Autolock autolock(mLock);
 
@@ -195,11 +200,11 @@ status_t SampleTable::setChunkOffsetParams(
     mNumChunkOffsets = U32_AT(&header[4]);
 
     if (mChunkOffsetType == kChunkOffsetType32) {
-        if (data_size < 8 + mNumChunkOffsets * 4) {
+      if ((data_size - 8) / 4 < mNumChunkOffsets) {
             return ERROR_MALFORMED;
         }
     } else {
-        if (data_size < 8 + mNumChunkOffsets * 8) {
+      if ((data_size - 8) / 8 < mNumChunkOffsets) {
             return ERROR_MALFORMED;
         }
     }
@@ -327,6 +332,7 @@ status_t SampleTable::setSampleSizeParams(
     mDefaultSampleSize = U32_AT(&header[4]);
     mNumSampleSizes = U32_AT(&header[8]);
     if (mNumSampleSizes > (UINT32_MAX - 12) / 16) {
+        ALOGE("b/23247055, mNumSampleSizes(%u)", mNumSampleSizes);
         return ERROR_MALFORMED;
     }
 
@@ -428,6 +434,10 @@ status_t SampleTable::setTimeToSampleParams(
     return OK;
 }
 
+// NOTE: per 14996-12, version 0 ctts contains unsigned values, while version 1
+// contains signed values, however some software creates version 0 files that
+// contain signed values, so we're always treating the values as signed,
+// regardless of version.
 status_t SampleTable::setCompositionTimeToSampleParams(
         off64_t data_offset, size_t data_size) {
     ALOGI("There are reordered frames present.");
@@ -443,19 +453,23 @@ status_t SampleTable::setCompositionTimeToSampleParams(
         return ERROR_IO;
     }
 
-    if (U32_AT(header) != 0) {
-        // Expected version = 0, flags = 0.
+    uint32_t flags = U32_AT(header);
+    uint32_t version = flags >> 24;
+    flags &= 0xffffff;
+
+    if ((version != 0 && version != 1) || flags != 0) {
+        // Expected version = 0 or 1, flags = 0.
         return ERROR_MALFORMED;
     }
 
     size_t numEntries = U32_AT(&header[4]);
 
-    if (data_size != (numEntries + 1) * 8) {
+    if (((SIZE_MAX / 8) - 1 < numEntries) || (data_size != (numEntries + 1) * 8)) {
         return ERROR_MALFORMED;
     }
 
     mNumCompositionTimeDeltaEntries = numEntries;
-    uint64_t allocSize = (uint64_t)numEntries * 2 * sizeof(uint32_t);
+    uint64_t allocSize = (uint64_t)numEntries * 2 * sizeof(int32_t);
     if (allocSize > kMaxTotalSize) {
         ALOGE("Composition-time-to-sample table size too large.");
         return ERROR_OUT_OF_RANGE;
@@ -473,7 +487,7 @@ status_t SampleTable::setCompositionTimeToSampleParams(
         return ERROR_OUT_OF_RANGE;
     }
 
-    mCompositionTimeDeltaEntries = new (std::nothrow) uint32_t[2 * numEntries];
+    mCompositionTimeDeltaEntries = new (std::nothrow) int32_t[2 * numEntries];
     if (!mCompositionTimeDeltaEntries) {
         ALOGE("Cannot allocate composition-time-to-sample table with %llu "
                 "entries.", (unsigned long long)numEntries);
@@ -610,6 +624,9 @@ void SampleTable::buildSampleEntriesTable() {
     Mutex::Autolock autoLock(mLock);
 
     if (mSampleTimeEntries != NULL || mNumSampleSizes == 0) {
+        if (mNumSampleSizes == 0) {
+            ALOGE("b/23247055, mNumSampleSizes(%u)", mNumSampleSizes);
+        }
         return;
     }
 
@@ -647,12 +664,28 @@ void SampleTable::buildSampleEntriesTable() {
 
                 mSampleTimeEntries[sampleIndex].mSampleIndex = sampleIndex;
 
-                uint32_t compTimeDelta =
+                int32_t compTimeDelta =
                     mCompositionDeltaLookup->getCompositionTimeOffset(
                             sampleIndex);
 
+                if ((compTimeDelta < 0 && sampleTime <
+                        (compTimeDelta == INT32_MIN ?
+                                INT32_MAX : uint32_t(-compTimeDelta)))
+                        || (compTimeDelta > 0 &&
+                                sampleTime > UINT32_MAX - compTimeDelta)) {
+                    ALOGE("%u + %d would overflow, clamping",
+                            sampleTime, compTimeDelta);
+                    if (compTimeDelta < 0) {
+                        sampleTime = 0;
+                    } else {
+                        sampleTime = UINT32_MAX;
+                    }
+                    compTimeDelta = 0;
+                }
+
                 mSampleTimeEntries[sampleIndex].mCompositionTime =
-                    sampleTime + compTimeDelta;
+                        compTimeDelta > 0 ? sampleTime + compTimeDelta:
+                                sampleTime - (-compTimeDelta);
             }
 
             ++sampleIndex;
@@ -942,7 +975,7 @@ status_t SampleTable::getMetaDataForSample(
     return OK;
 }
 
-uint32_t SampleTable::getCompositionTimeOffset(uint32_t sampleIndex) {
+int32_t SampleTable::getCompositionTimeOffset(uint32_t sampleIndex) {
     return mCompositionDeltaLookup->getCompositionTimeOffset(sampleIndex);
 }
 
